@@ -34,7 +34,7 @@ torch = [
 torchvision = {index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys_platform == 'win32'"}
 isaacsim = { index = "isaac" }
 real2simeval = { workspace = true }
-openpi-client = { git = "https://github.com/Physical-Intelligence/openpi.git", subdirectory = "packages/openpi-client" }
+openpi-client = { path = "../openpi/packages/openpi-client", editable = true }
 
 [[tool.uv.index]]
 name = "isaac"
