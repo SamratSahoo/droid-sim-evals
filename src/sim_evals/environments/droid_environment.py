@@ -1,3 +1,4 @@
+import json
 import logging
 import torch
 import isaaclab.sim as sim_utils
@@ -12,7 +13,7 @@ from isaaclab.envs.mdp.actions.actions_cfg import BinaryJointPositionActionCfg
 from isaaclab.envs.mdp.actions.binary_joint_actions import BinaryJointPositionAction
 from isaaclab.envs.mdp.actions.joint_actions import JointAction
 from isaaclab.utils import configclass, noise
-from isaaclab.assets import AssetBaseCfg, ArticulationCfg, RigidObjectCfg
+from isaaclab.assets import AssetBaseCfg, ArticulationCfg, RigidObjectCfg, DeformableObjectCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.scene import InteractiveSceneCfg
@@ -24,6 +25,7 @@ from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg
 from isaaclab.sensors import CameraCfg
 
 from .nvidia_droid import NVIDIA_DROID
+from .mesh_assets import FileMeshCfg, UsdRigidCfg
 
 DATA_PATH = Path(__file__).parent / "../../../assets/"
 
@@ -128,6 +130,106 @@ class SceneCfg(InteractiveSceneCfg):
                             rot=rot,
                         ),
                     )
+            setattr(self, name, asset)
+
+        # Programmatically-spawned objects (rigid + deformable) described by an optional
+        # `scene<name>.json` sidecar next to the USD. Used by scene 6 (plate + 3 deformable
+        # toys) whose meshes are scanned assets without baked physics; see mesh_assets.py.
+        self._add_sidecar_objects(scene_name)
+
+    def _add_sidecar_objects(self, scene_name: str):
+        """Spawn rigid/deformable objects from preprocessed meshes listed in a sidecar JSON.
+
+        Each entry spawns via :class:`FileMeshCfg` (the Isaac-native mesh spawn path):
+        ``kind: "rigid"`` -> a :class:`RigidObjectCfg` with a convex collider; ``kind:
+        "deformable"`` -> a :class:`DeformableObjectCfg` (PhysX FEM soft body, tetrahedralized
+        at spawn from the watertight mesh). Poses are in world meters.
+        """
+        spec_path = (DATA_PATH / f"scene{scene_name}.json").resolve()
+        if not spec_path.exists():
+            return
+        spec = json.loads(spec_path.read_text())
+        for obj in spec.get("objects", []):
+            name = obj["name"]
+            pos = tuple(obj.get("pos", (0.0, 0.0, 0.0)))
+            rot = tuple(obj.get("rot", (1.0, 0.0, 0.0, 0.0)))
+            kind = obj.get("kind", "rigid")
+
+            if kind == "usd_rigid":
+                # Reference a textured USD/USDZ asset directly (keeps its scanned material/
+                # textures) as a rigid body with a convex collider; scale/pose from the sidecar.
+                s = float(obj.get("scale", 1.0))
+                spawn = UsdRigidCfg(
+                    usd_path=str((DATA_PATH / obj["usd"]).resolve()),
+                    scale=(s, s, s),
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+                    collision_props=sim_utils.CollisionPropertiesCfg(),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=obj.get("mass", 0.03)),
+                    collision_approximation=obj.get("collision", "convexHull"),
+                )
+                setattr(self, name, RigidObjectCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/{name}",
+                    spawn=spawn,
+                    init_state=RigidObjectCfg.InitialStateCfg(pos=pos, rot=rot),
+                ))
+                continue
+
+            mesh_path = str((DATA_PATH / obj["mesh"]).resolve())
+            visual = sim_utils.PreviewSurfaceCfg(
+                diffuse_color=tuple(obj.get("color", (0.7, 0.7, 0.7))),
+                roughness=0.6,
+                metallic=0.0,
+            )
+            if kind == "deformable":
+                dp = obj.get("deformable", {})
+                spawn = FileMeshCfg(
+                    mesh_path=mesh_path,
+                    deformable_props=sim_utils.DeformableBodyPropertiesCfg(
+                        rest_offset=dp.get("rest_offset", 0.001),
+                        contact_offset=dp.get("contact_offset", 0.002),
+                        solver_position_iteration_count=dp.get("solver_iters", 20),
+                        simulation_hexahedral_resolution=dp.get("hex_res", 10),
+                        self_collision=dp.get("self_collision", False),
+                    ),
+                    physics_material=sim_utils.DeformableBodyMaterialCfg(
+                        youngs_modulus=dp.get("youngs", 5e6),
+                        poissons_ratio=dp.get("poisson", 0.4),
+                        dynamic_friction=dp.get("friction", 0.6),
+                    ),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=obj.get("mass", 0.03)),
+                    visual_material=visual,
+                )
+                asset = DeformableObjectCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/{name}",
+                    spawn=spawn,
+                    init_state=DeformableObjectCfg.InitialStateCfg(pos=pos, rot=rot),
+                )
+            else:  # rigid
+                rp = obj.get("rigid", {})
+                spawn = FileMeshCfg(
+                    mesh_path=mesh_path,
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        kinematic_enabled=obj.get("kinematic", False),
+                        # A large flat convex disc resting on the table can blow up via
+                        # explosive depenetration; cap it and add solver iterations.
+                        max_depenetration_velocity=rp.get("max_depenetration_velocity", 1.0),
+                        solver_position_iteration_count=rp.get("solver_iters", 32),
+                    ),
+                    collision_props=sim_utils.CollisionPropertiesCfg(),
+                    collision_approximation=obj.get("collision"),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=obj.get("mass", 0.4)),
+                    physics_material=sim_utils.RigidBodyMaterialCfg(
+                        static_friction=rp.get("static_friction", 1.0),
+                        dynamic_friction=rp.get("dynamic_friction", 1.0),
+                        restitution=rp.get("restitution", 0.0),
+                    ),
+                    visual_material=visual,
+                )
+                asset = RigidObjectCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/{name}",
+                    spawn=spawn,
+                    init_state=RigidObjectCfg.InitialStateCfg(pos=pos, rot=rot),
+                )
             setattr(self, name, asset)
 
 
@@ -395,6 +497,8 @@ class EnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_temp_buffer_capacity = 2**26
         self.sim.physx.gpu_heap_capacity = 2**26
         self.sim.physx.gpu_collision_stack_size = 2**26
+        # Headroom for PhysX FEM soft-body (deformable toy) contacts in scene 6.
+        self.sim.physx.gpu_max_soft_body_contacts = 2**21
         self.rerender_on_reset = True
 
     

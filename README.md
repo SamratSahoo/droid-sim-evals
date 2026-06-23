@@ -137,3 +137,56 @@ for _ in tqdm(range(max_steps), desc=f"Episode"):
         break
 env.close()
 ```
+
+## Full Comparison Eval (Pi-0.5 vs tiptop)
+
+`full_eval.py` evaluates **both** Pi-0.5 (openpi, `:8000`) and **tiptop** (`:8765`)
+across the scenes, records a video per policy per scene, and stitches each scene's
+two runs into a single labeled **side-by-side** comparison video (`Pi-0.5 | tiptop`).
+
+Unlike `tiptop_eval.py`, this script **launches and tears down the policy servers
+itself**. It picks how to schedule them based on available VRAM:
+
+- `concurrent` — both servers up at once (5 Isaac launches).
+- `alternating` — one server at a time: run all scenes for one policy, kill it, then
+  the other (10 Isaac launches, lower peak VRAM). Each phase matches an already-proven
+  single-policy config.
+- `auto` (default) — concurrent only if a single GPU has `>= --concurrent-min-vram-gb`
+  (default 48) or multiple GPUs exist; otherwise alternating.
+
+```bash
+# all 5 scenes (variant 0), auto server scheduling
+uv run python full_eval.py
+
+# force one-at-a-time (e.g. single 24-32 GB GPU); single scene
+uv run python full_eval.py --mode alternating --scenes 1
+
+# servers already running -> just connect, run, and stitch
+uv run python full_eval.py --no-launch-servers
+
+# re-build comparison videos from existing per-policy mp4s (no GPU needed)
+uv run python full_eval.py --stitch-only --out-dir runs/<date>/<time>
+```
+
+Outputs land in `runs/<date>/<time>/`:
+`pi05_scene{N}.mp4`, `tiptop_scene{N}.mp4`, and `comparison_scene{N}.mp4`.
+
+> Pi-0.5 has no task-completion signal, so it runs the full `--episode-length-s`
+> (default 90s) while tiptop stops when its plan finishes (the comparison freezes the
+> shorter clip's last frame). Lower `--episode-length-s` for snappier side-by-sides.
+
+### tiptop perception servers (M2T2 / Gemini)
+
+The tiptop planning server needs a grasp service (**M2T2**, `:8123`) and a **Gemini
+API key**. `full_eval.py` launches the M2T2 server automatically before the tiptop
+phase and kills it after (`--launch-perception`, on by default; set up under
+`../M2T2`, see `../M2T2/SERVER_README.md`). You only need to export the key:
+
+```bash
+export GEMINI_API_KEY=...           # tiptop perception (Gemini Robotics-ER)
+uv run python full_eval.py          # M2T2 is launched/killed for you
+```
+
+FoundationStereo (`../FoundationStereo`) is **not** required in sim — the tiptop
+server runs perception with the simulator's depth. A server scaffold is provided;
+enable it with `--launch-fs` only after adding its (gated) weights + env.

@@ -1,0 +1,58 @@
+{
+  "plate": {
+    "file": "/home/samrat/tamp-vla/tamp-vla/droid-sim-evals/assets/custom/plate_toys/processed/plate.obj",
+    "kind": "rigid",
+    "extents_m": [
+      0.225,
+      0.2253,
+      0.0356
+    ],
+    "longest_m": 0.2253,
+    "n_faces": 8000,
+    "watertight": false,
+    "components": 4,
+    "scale_applied": 0.11211468382659902
+  },
+  "blue_toy": {
+    "file": "/home/samrat/tamp-vla/tamp-vla/droid-sim-evals/assets/custom/plate_toys/processed/blue_toy.obj",
+    "kind": "deformable",
+    "extents_m": [
+      0.0554,
+      0.09,
+      0.0309
+    ],
+    "longest_m": 0.09,
+    "n_faces": 1040,
+    "watertight": true,
+    "components": 1,
+    "scale_applied": 0.045
+  },
+  "brown_toy": {
+    "file": "/home/samrat/tamp-vla/tamp-vla/droid-sim-evals/assets/custom/plate_toys/processed/brown_toy.obj",
+    "kind": "deformable",
+    "extents_m": [
+      0.09,
+      0.0375,
+      0.0268
+    ],
+    "longest_m": 0.09,
+    "n_faces": 884,
+    "watertight": true,
+    "components": 1,
+    "scale_applied": 0.045
+  },
+  "pink_toy": {
+    "file": "/home/samrat/tamp-vla/tamp-vla/droid-sim-evals/assets/custom/plate_toys/processed/pink_toy.obj",
+    "kind": "deformable",
+    "extents_m": [
+      0.0372,
+      0.09,
+      0.0267
+    ],
+    "longest_m": 0.09,
+    "n_faces": 1224,
+    "watertight": true,
+    "components": 1,
+    "scale_applied": 0.045
+  }
+}

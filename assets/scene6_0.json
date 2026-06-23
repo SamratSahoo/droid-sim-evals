@@ -1,0 +1,102 @@
+{
+  "_comment": "Sidecar for scene6_0.usd. Objects spawned programmatically by SceneCfg.dynamic_scene via FileMeshCfg (src/sim_evals/environments/mesh_assets.py). Plate=rigid, toys=deformable (PhysX FEM). Poses are world meters; the table-top collider surface sits at z~=0.395 (measured live), so objects are placed at z=0.40 to settle onto it. Meshes are preprocessed (Z-up, metric, watertight toys) under custom/plate_toys/processed/.",
+  "objects": [
+    {
+      "name": "plate",
+      "kind": "rigid",
+      "mesh": "custom/plate_toys/processed/plate.obj",
+      "pos": [
+        0.45,
+        0.1,
+        0.05
+      ],
+      "rot": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": [
+        0.85,
+        0.85,
+        0.88
+      ],
+      "mass": 0.4,
+      "collision": "convexHull",
+      "rigid": {
+        "static_friction": 1.0,
+        "dynamic_friction": 1.0
+      },
+      "kinematic": false
+    },
+    {
+      "name": "blue_toy",
+      "kind": "usd_rigid",
+      "pos": [
+        0.3,
+        0.2,
+        0.0679
+      ],
+      "rot": [
+        0.70710678,
+        0.70710678,
+        0.0,
+        0.0
+      ],
+      "color": [
+        0.1,
+        0.25,
+        0.85
+      ],
+      "mass": 0.03,
+      "usd": "custom/plate_toys/blue_toy.usdz",
+      "scale": 0.045
+    },
+    {
+      "name": "brown_toy",
+      "kind": "usd_rigid",
+      "pos": [
+        0.34,
+        -0.08,
+        0.0657
+      ],
+      "rot": [
+        0.70710678,
+        0.70710678,
+        0.0,
+        0.0
+      ],
+      "color": [
+        0.4,
+        0.26,
+        0.13
+      ],
+      "mass": 0.03,
+      "usd": "custom/plate_toys/brown_toy.usdz",
+      "scale": 0.045
+    },
+    {
+      "name": "pink_toy",
+      "kind": "usd_rigid",
+      "pos": [
+        0.59,
+        0.22,
+        0.0681
+      ],
+      "rot": [
+        0.70710678,
+        0.70710678,
+        0.0,
+        0.0
+      ],
+      "color": [
+        0.92,
+        0.45,
+        0.62
+      ],
+      "mass": 0.03,
+      "usd": "custom/plate_toys/pink_toy.usdz",
+      "scale": 0.045
+    }
+  ]
+}
