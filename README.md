@@ -14,7 +14,13 @@ The simulator includes **5 scenes** (1–5), each with multiple variants that pl
 
 The simulation is tuned to work *zero-shot* with DROID policies trained on the real-world DROID dataset, so no separate simulation data is required.
 
-**Note:** The current simulator works best for policies trained with *joint position* action space (and *not* joint velocity control). We provide examples for evaluating pi0-FAST-DROID policies trained with joint position control below.
+**Note:** The simulator's arm term supports **both** DROID action spaces, selected at runtime
+(see `set_arm_control_mode` in `src/sim_evals/environments/droid_environment.py`): *joint
+position* (absolute targets — tiptop plan waypoints and the `pi05_droid_jointpos` checkpoint) and
+*joint velocity* (rad/s, integrated onto the current joint position each control step — the stock
+`pi05_droid` checkpoint and velocity-trained finetunes). `full_eval.py` sets velocity mode for the
+pi05 policy and position mode for tiptop automatically. The default pi05 baseline is `pi05_droid`
+(velocity).
 
 ## Scenes
 
@@ -105,11 +111,12 @@ unzip assets.zip
 
 Then, in a separate terminal, launch the policy server on `localhost:8000`. 
 
-For example, to launch a pi0.5 policy (with joint position control),
-checkout [openpi](https://github.com/Physical-Intelligence/openpi) and use the `polaris` configs 
+For example, to launch the stock pi0.5 DROID policy (joint *velocity* action space — the env
+runs in velocity mode for pi05), checkout [openpi](https://github.com/Physical-Intelligence/openpi):
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_droid_jointpos_polaris --policy.dir=gs://openpi-assets/checkpoints/pi05_droid_jointpos
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_droid --policy.dir=gs://openpi-assets/checkpoints/pi05_droid
 ```
+(For a joint-*position* checkpoint instead, serve `--policy.config=pi05_droid_jointpos_polaris --policy.dir=gs://openpi-assets/checkpoints/pi05_droid_jointpos`; the env auto-selects position vs velocity per policy.)
 
 **Note**: We set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.5` to avoid JAX hogging all the GPU memory (since Isaac Sim needs to use the same GPU).
 

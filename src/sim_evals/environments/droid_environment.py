@@ -9,9 +9,9 @@ from typing import List
 from pathlib import Path
 from pxr import Usd, UsdPhysics
 
-from isaaclab.envs.mdp.actions.actions_cfg import BinaryJointPositionActionCfg
+from isaaclab.envs.mdp.actions.actions_cfg import BinaryJointPositionActionCfg, JointPositionActionCfg
 from isaaclab.envs.mdp.actions.binary_joint_actions import BinaryJointPositionAction
-from isaaclab.envs.mdp.actions.joint_actions import JointAction
+from isaaclab.envs.mdp.actions.joint_actions import JointAction, JointPositionAction
 from isaaclab.utils import configclass, noise
 from isaaclab.assets import AssetBaseCfg, ArticulationCfg, RigidObjectCfg, DeformableObjectCfg
 from isaaclab.actuators import ImplicitActuatorCfg
@@ -22,7 +22,7 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg
-from isaaclab.sensors import CameraCfg
+from isaaclab.sensors import CameraCfg, TiledCameraCfg
 
 from .nvidia_droid import NVIDIA_DROID
 from .mesh_assets import FileMeshCfg, UsdRigidCfg
@@ -30,6 +30,52 @@ from .mesh_assets import FileMeshCfg, UsdRigidCfg
 DATA_PATH = Path(__file__).parent / "../../../assets/"
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# Arm control mode (runtime-switchable; one Isaac env is shared by several      #
+# policies within a worker process, so the arm term's interpretation of the     #
+# policy's 7 arm outputs is flipped at runtime -- see full_eval.run_worker).     #
+#                                                                                #
+#   "position" (default): outputs are ABSOLUTE joint-position targets. Used by   #
+#       tiptop (cuRobo plan waypoints) and the pi05_droid_jointpos checkpoint.   #
+#       Behaves exactly like the original mdp.JointPositionActionCfg, so data-   #
+#       gen / tiptop eval are unaffected.                                        #
+#   "velocity": outputs are JOINT VELOCITIES (rad/s) from a velocity-action      #
+#       policy (stock pi05_droid, or a velocity-trained finetune). They are      #
+#       integrated onto the current measured joint position each control step    #
+#       (q_target = q_meas + v * step_dt) and fed to the SAME stiff position     #
+#       controller -- so no actuator-gain retuning is needed and re-reading      #
+#       q_meas every step prevents open-loop integration drift.                  #
+# --------------------------------------------------------------------------- #
+_ARM_CONTROL = {"mode": "position"}
+
+
+def set_arm_control_mode(mode: str) -> None:
+    """Select how the arm action term interprets the policy's 7 arm outputs.
+
+    ``"position"`` (default) = absolute joint-position targets; ``"velocity"`` =
+    joint velocities integrated onto the current joint position. Call before
+    stepping a given policy (the setting is process-global, one env per worker).
+    """
+    if mode not in ("position", "velocity"):
+        raise ValueError(f"arm control mode must be 'position' or 'velocity', got {mode!r}")
+    _ARM_CONTROL["mode"] = mode
+
+
+def set_camera_resolution(env_cfg, height: int, width: int) -> None:
+    """Override the render resolution of all DROID cameras on a parsed env cfg.
+
+    Cameras default to 180x320 (the LeRobot/DROID image size) so data generation renders only the
+    pixels it keeps; full_eval.py overrides to the full 720x1280 sensor resolution for higher-
+    fidelity comparison videos. Call after ``parse_env_cfg`` and before ``gym.make`` (the cfg is
+    read when the scene is built).
+    """
+    for cam_name in ("external_cam", "external_cam_2", "wrist_cam"):
+        cam = getattr(env_cfg.scene, cam_name)
+        cam.height = height
+        cam.width = width
+
 
 @configclass
 class SceneCfg(InteractiveSceneCfg):
@@ -43,10 +89,16 @@ class SceneCfg(InteractiveSceneCfg):
 
     robot = NVIDIA_DROID
 
-    external_cam = CameraCfg(
+    # TiledCamera = one tiled render pass per camera across ALL envs, so vision scales to many
+    # parallel envs without exhausting the RTX renderer's per-viewport descriptor pool (plain per-env
+    # Camera sensors hit "Unable to allocate descriptor sets" at ~32 envs x 3 cams; tiled also renders
+    # faster). Same CameraData interface (.data.output / intrinsics / pos_w), so the obs funcs below
+    # are unchanged. Default 180x320 (the LeRobot/DROID image size) so data gen renders only the pixels
+    # it keeps; full_eval.py overrides to 720x1280 via set_camera_resolution() for eval.
+    external_cam = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/external_cam",
-        height=720,
-        width=1280,
+        height=180,
+        width=320,
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=2.1,
@@ -59,10 +111,10 @@ class SceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    external_cam_2 = CameraCfg(
+    external_cam_2 = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/external_cam_2",
-        height=720,
-        width=1280,
+        height=180,
+        width=320,
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=2.1,
@@ -75,10 +127,10 @@ class SceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    wrist_cam = CameraCfg(
+    wrist_cam = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/robot/Gripper/Robotiq_2F_85/base_link/wrist_cam",
-        height=720,
-        width=1280,
+        height=180,
+        width=320,
         data_types=["rgb", "distance_to_image_plane"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=2.8,
@@ -266,9 +318,64 @@ class BinaryJointPositionZeroToOneActionCfg(BinaryJointPositionActionCfg):
 
     class_type = BinaryJointPositionZeroToOneAction
 
+
+class ArmJointAction(JointPositionAction):
+    """Arm action term supporting absolute-position and integrated-velocity control.
+
+    In ``"position"`` mode this is identical to :class:`JointPositionAction` (the 7 arm
+    outputs are absolute joint-position targets). In ``"velocity"`` mode the outputs are
+    treated as joint velocities (rad/s) and integrated onto the *current measured* joint
+    position over one control step before being applied as a position target -- letting a
+    velocity-action policy (e.g. pi05_droid) drive the same stiff position-controlled
+    Franka without retuning actuators. The mode is read from :data:`_ARM_CONTROL` every
+    step, so a single shared env can switch policies at runtime.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        # Velocity feed-forward target (rad/s); zero except in velocity mode.
+        self._vel_target = torch.zeros(self.num_envs, self.action_dim, device=self.device)
+
+    def process_actions(self, actions: torch.Tensor):
+        if _ARM_CONTROL["mode"] == "velocity":
+            self._raw_actions[:] = actions
+            # Treat outputs as joint velocities (rad/s). Set the position target one control step
+            # ahead (q_meas + v*step_dt; step_dt = decimation*sim.dt = 1/15 s) and stash the velocity
+            # feed-forward; apply_actions commands BOTH so the stiff PD's damping term (kd) drives the
+            # joint toward v instead of opposing it (a position-only target tracks at only ~kp*dt/(kd+..)
+            # of v). Re-reading q_meas each step makes this a closed-loop follower with no drift.
+            self._vel_target = self._raw_actions * self._scale
+            q_cur = self._asset.data.joint_pos[:, self._joint_ids]
+            self._processed_actions = q_cur + self._vel_target * self._env.step_dt
+            if self.cfg.clip is not None:
+                self._processed_actions = torch.clamp(
+                    self._processed_actions, min=self._clip[:, :, 0], max=self._clip[:, :, 1]
+                )
+        else:
+            super().process_actions(actions)
+            self._vel_target = torch.zeros_like(self._processed_actions)
+
+    def apply_actions(self):
+        # Always command the position target; in velocity mode also command the velocity feed-forward.
+        # In position mode _vel_target is zero, so this is identical to JointPositionAction (the joint
+        # velocity target defaults to zero there too).
+        self._asset.set_joint_velocity_target(self._vel_target, joint_ids=self._joint_ids)
+        self._asset.set_joint_position_target(self.processed_actions, joint_ids=self._joint_ids)
+
+
+@configclass
+class ArmJointActionCfg(JointPositionActionCfg):
+    """Config for :class:`ArmJointAction` (dual-mode position/velocity arm control)."""
+
+    class_type = ArmJointAction
+
+
 @configclass
 class ActionCfg:
-    body = mdp.JointPositionActionCfg(
+    # Dual-mode arm term: absolute joint positions ("position", default) or integrated
+    # joint velocities ("velocity"); switch via set_arm_control_mode(). In "position" mode
+    # it is byte-for-byte the original mdp.JointPositionActionCfg behaviour.
+    body = ArmJointActionCfg(
         asset_name="robot",
         joint_names=["panda_joint.*"],
         preserve_order=True,

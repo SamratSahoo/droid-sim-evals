@@ -213,9 +213,12 @@ def run_worker(
     # order here is load-bearing -- do not reorder.
     from src.sim_evals.inference.pi05_websocket import Pi05WebsocketClient
     from src.sim_evals.inference.tiptop_websocket import TiptopWebsocketClient
+    from src.sim_evals.environments.droid_environment import set_arm_control_mode, set_camera_resolution
 
     env_cfg = parse_env_cfg("DROID", device=args_cli.device, num_envs=1, use_fabric=True)
     env_cfg.set_scene(str(worker_scene), variant)
+    # Eval renders at full sensor resolution; data generation defaults to 180x320 for render speed.
+    set_camera_resolution(env_cfg, 720, 1280)
     env_cfg.episode_length_s = episode_length_s
     env = gym.make("DROID", cfg=env_cfg)
 
@@ -233,18 +236,33 @@ def run_worker(
                 logger.info(f"[scene {worker_scene}] connecting tiptop @ {tiptop_host}:{tiptop_port}")
                 client = TiptopWebsocketClient(host=tiptop_host, port=tiptop_port)
                 is_tiptop = True
+                # tiptop emits absolute joint-position waypoints from the cuRobo plan.
+                rollout_mode = "position"
             elif policy == "pi05":
                 logger.info(f"[scene {worker_scene}] connecting pi-0.5 @ {pi05_host}:{pi05_port}")
                 client = Pi05WebsocketClient(host=pi05_host, port=pi05_port, open_loop_horizon=open_loop_horizon)
                 is_tiptop = False
+                # pi05_droid (and velocity-trained finetunes) emit joint velocities; the env
+                # integrates them onto the current joint position (see set_arm_control_mode).
+                rollout_mode = "velocity"
             else:
                 logger.warning(f"Unknown policy '{policy}', skipping")
                 continue
 
+            # settle_sim holds the pose by commanding the measured joint POSITIONS, so it must run
+            # in position mode regardless of the policy; switch to the rollout mode only afterwards
+            # (in velocity mode those positions would be misread as velocities and drift the arm).
+            set_arm_control_mode("position")
             obs, _ = env.reset()
             obs = settle_sim(env, obs, reset_episode_buf=True)
+            set_arm_control_mode(rollout_mode)
             out_path = out / f"{policy}_scene{worker_scene}.mp4"
             n = run_rollout(env, obs, client, instruction, max_steps, is_tiptop, out_path)
+            # Dump the full inference trace (proprioception, requests, action chunks,
+            # post-processed actions) for offline debugging when enabled. No-op unless
+            # PI05_DEBUG_DUMP is set and the client recorded steps.
+            if hasattr(client, "dump_debug"):
+                client.dump_debug(out / f"{policy}_scene{worker_scene}_debug.npz")
             try:
                 client.reset()
                 client.close()
@@ -764,8 +782,8 @@ def main(
     tiptop_label: str = "tiptop",
     openpi_dir: str = DEFAULT_OPENPI_DIR,
     tiptop_dir: str = DEFAULT_TIPTOP_DIR,
-    pi05_config: str = "pi05_droid_jointpos_polaris",
-    pi05_checkpoint: str = "gs://openpi-assets/checkpoints/pi05_droid_jointpos",
+    pi05_config: str = "pi05_droid",
+    pi05_checkpoint: str = "gs://openpi-assets/checkpoints/pi05_droid",
     tiptop_server_module: str = "tiptop.tiptop_websocket_server",
     xla_mem_fraction: float = 0.5,
     server_ready_timeout_s: float = 1200.0,

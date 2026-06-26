@@ -1095,7 +1095,7 @@ def main(
     d100_repo: str = "SamratSahoo/d100",
     merge_repo_id: str = "SamratSahoo/d100_toys100_sim",
     subset_merge_repo_id: str = "SamratSahoo/d100_toys20_sim",
-    num_envs: int = 8,
+    num_envs: int = 256,  # parallel envs/batch — amortizes the dominant ~150s render; ~16GB on the 32GB 5090. With the perception-overlap server, planning no longer serializes badly at high N, so 24-32 is worth trying (watch VRAM + Gemini rate limits).
     max_steps_per_episode: int = 2400,
     max_attempts: int = 400,
     settle_steps: int = 120,
