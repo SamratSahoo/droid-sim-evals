@@ -67,6 +67,15 @@ DEFAULT_INSTRUCTIONS = {
     4: "Put the cube on the mug and the cans in the bowl.",
     5: "Put 3 blocks in the bowl.",
     6: "Place the toys on the plate with no collisions",
+    7: "Push the yellow cube next to the red cube and push the blue cube next to the green cube",
+}
+
+# Some tasks reuse another scene's geometry with a different instruction. Maps a task id
+# (used for the instruction and the output filenames) to the scene<N>_<variant>.usd loaded
+# for it; task ids not listed here load scene<id>_<variant>.usd as usual. Task 7 is a "push"
+# task over Scene 5's colored blocks (no bowl-placement goal), so it loads Scene 5's geometry.
+SCENE_GEOMETRY = {
+    7: "5",
 }
 
 KNOWN_POLICIES = ("pi05", "tiptop")
@@ -213,10 +222,15 @@ def run_worker(
     # order here is load-bearing -- do not reorder.
     from src.sim_evals.inference.pi05_websocket import Pi05WebsocketClient
     from src.sim_evals.inference.tiptop_websocket import TiptopWebsocketClient
-    from src.sim_evals.environments.droid_environment import set_arm_control_mode, set_camera_resolution
+    from src.sim_evals.environments.droid_environment import (
+        collapse_dome_lights,
+        set_arm_control_mode,
+        set_camera_resolution,
+    )
 
     env_cfg = parse_env_cfg("DROID", device=args_cli.device, num_envs=1, use_fabric=True)
-    env_cfg.set_scene(str(worker_scene), variant)
+    # Most tasks load scene<worker_scene>; a few (e.g. task 7) reuse another scene's geometry.
+    env_cfg.set_scene(SCENE_GEOMETRY.get(worker_scene, str(worker_scene)), variant)
     # Eval renders at full sensor resolution; data generation defaults to 180x320 for render speed.
     set_camera_resolution(env_cfg, 720, 1280)
     env_cfg.episode_length_s = episode_length_s
@@ -224,6 +238,10 @@ def run_worker(
 
     obs, _ = env.reset()
     obs, _ = env.reset()  # second render cycle for correctly loaded materials
+    # Use the single global dome (SceneCfg.global_dome) for ambient; deactivate the per-env scene-USD
+    # DomeLight clones. Keeps lighting identical between this eval (num_envs=1) and multi-env data
+    # generation -- otherwise N cloned infinite domes stack and over-expose multi-env frames.
+    collapse_dome_lights()
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -803,7 +821,8 @@ def main(
     """Run Pi-0.5 and tiptop across scenes and produce side-by-side comparison videos.
 
     Args:
-        scenes: Scene numbers to evaluate (each yields one comparison video).
+        scenes: Scene numbers to evaluate (each yields one comparison video). Task 7
+            reuses Scene 5's geometry with a "push the cubes together" instruction.
         variant: Scene variant index (object configuration).
         mode: Server scheduling: ``auto`` | ``concurrent`` | ``alternating``.
         policies: Which policies to run (``pi05``, ``tiptop``). Stitching needs both.

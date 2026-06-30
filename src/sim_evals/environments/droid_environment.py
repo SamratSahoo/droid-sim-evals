@@ -77,14 +77,73 @@ def set_camera_resolution(env_cfg, height: int, width: int) -> None:
         cam.width = width
 
 
+def collapse_dome_lights() -> int:
+    """Zero the per-env cloned DomeLights so only the single global ``/World/global_dome`` lights the scene.
+
+    The scene USD (scene6_*.usd) embeds a DomeLight, and the scene is referenced per-env at
+    ``{ENV_REGEX_NS}/scene``, so InteractiveScene clones the dome once per env -> ``num_envs`` DomeLights.
+    A DomeLight is infinite and non-attenuating, so the N clones SUM and over-illuminate every env's
+    cameras: rendered brightness scales with ``num_envs`` (spacing, UsdLux light-linking, and a
+    *runtime*-added global dome all have NO effect in this renderer -- verified empirically). The
+    single-env eval (num_envs=1) looks correct; multi-env data generation washes out / clips highlights.
+
+    Fix: ``SceneCfg.global_dome`` provides ONE config-time DomeLight at an absolute ``/World`` path (never
+    cloned), spawned through Isaac's normal pipeline so the renderer registers it; being infinite it lights
+    every env uniformly regardless of env count. Here we zero the per-env cloned domes (matched by their
+    ``/envs/`` path) so that global dome is the only ambient source -> lighting is num_envs-INVARIANT and
+    identical to the single-env eval. Per-env SphereLights are left alone (they don't stack and each env
+    needs its own local key light). Call ONCE after the env is built (``gym.make``). Returns domes zeroed.
+    """
+    import omni.usd
+
+    stage = omni.usd.get_context().get_stage()
+    zeroed = 0
+    for prim in stage.Traverse():
+        if str(prim.GetTypeName()) != "DomeLight":
+            continue
+        if "/envs/" not in str(prim.GetPath()):
+            continue  # keep the single global /World/global_dome
+        # Deactivate the prim outright (removes it from the composed stage) AND zero intensity --
+        # a runtime intensity=0 alone may not propagate to the Fabric/RTX render of an already-built clone.
+        for attr in ("inputs:intensity", "intensity"):
+            a = prim.GetAttribute(attr)
+            if a and a.IsValid() and a.Get() is not None:
+                a.Set(0.0)
+        prim.SetActive(False)
+        zeroed += 1
+    logger.info(f"collapse_dome_lights: deactivated {zeroed} per-env domes; ambient via /World/global_dome")
+    return zeroed
+
+
 @configclass
 class SceneCfg(InteractiveSceneCfg):
     """Configuration for a cart-pole scene."""
 
+    # Per-env key light: cloned into every env at its LOCAL (0,-0.6,0.7) like the rest of the
+    # scene. An absolute path (e.g. /World/...) makes this a singleton that only lights the env
+    # near the world origin, so multi-env data generation (num_envs>>1) renders most episodes
+    # with dome light alone -- visibly dimmer/flatter than the single-env eval. Keeping it under
+    # {ENV_REGEX_NS} makes 256-env data-gen frames match 1-env eval frames.
     sphere_light = AssetBaseCfg(
-        prim_path="/World/spehre",
+        prim_path="{ENV_REGEX_NS}/spehre",
         spawn=sim_utils.SphereLightCfg(intensity=5000),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, -0.6, 0.7)),
+    )
+
+    # Single global ambient dome at an absolute /World path so it is NEVER cloned per-env. Being an
+    # infinite environment light it illuminates every env uniformly, so ambient lighting is independent
+    # of num_envs and matches the single-env eval. This replaces the scene USD's embedded DomeLight,
+    # which (referenced per-env at {ENV_REGEX_NS}/scene) is cloned num_envs times and SUMS into massive
+    # overexposure; collapse_dome_lights() zeroes those clones at runtime. Mirrors scene6_0.usd's dome
+    # (HDR billiard_hall, latlong, 135deg yaw about Z).
+    global_dome = AssetBaseCfg(
+        prim_path="/World/global_dome",
+        spawn=sim_utils.DomeLightCfg(
+            intensity=1000.0,
+            texture_file=str((DATA_PATH / "backgrounds" / "billiard_hall_4k.hdr").resolve()),
+            texture_format="latlong",
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(rot=(0.38268343, 0.0, 0.0, 0.92388)),
     )
 
     robot = NVIDIA_DROID

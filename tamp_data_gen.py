@@ -7,15 +7,27 @@ LeRobot dataset (the same schema as ``SamratSahoo/d100`` / ``toys20``) uploaded 
 ``SamratSahoo/toys100_sim``. It loads directly through openpi's ``LeRobotDROIDDataConfig``.
 
 Data representation (see plan / README):
-  * Images          -> the ACTUAL sim-rendered camera frames captured during execution.
+  * Images            -> the ACTUAL sim-rendered camera frames captured during execution.
   * joint_position,
-    gripper_position,
-    actions (7 joint velocities + gripper) -> the cuRobo PLAN (positions/velocities),
-                       resampled 50 Hz -> 15 Hz, so state and action stay kinematically
-                       consistent (this is openpi's reference-converter approach; finite-
-                       differencing the position-controlled sim joints is *not* used because
-                       it yields velocities 15-70x over physical limits).
-  * Success gating  -> measured sim object poses (sim-truth).
+    gripper_position  -> the MEASURED sim proprioception captured each frame during execution
+                         (the real articulation joint states, read from the sim every step -- NOT
+                         the cuRobo plan). The gripper is the continuous finger opening in [0,1]
+                         (0 open, 1 closed), so it ramps smoothly (~0.8 s open<->close) instead of
+                         snapping. This fixes the binary/bang-bang gripper that made fine-tuned
+                         policies chatter the gripper open/closed.
+  * actions (8)       -> [7 joint velocities | 1 gripper position], on the SAME 15 Hz recorded-frame
+                         timeline as the proprioception. The 7 joint velocities are the per-frame forward
+                         difference of the COMMANDED joint positions (the cuRobo waypoint the client
+                         issued each step) -- i.e. the velocity actually executed: ~zero while the arm
+                         holds during a gripper open/close, the planned velocity during motion. (Finite-
+                         differencing the *measured* position-controlled joints is *not* used -- it
+                         yields velocities 15-70x over physical limits; the *commanded* waypoints are
+                         smooth, so differencing them is fine, and unlike the raw plan velocities it
+                         stays aligned with the measured state across gripper-hold frames.) The gripper
+                         action is the MEASURED next-frame finger opening -- a continuous gripper-position
+                         command that leads the state by one 15 Hz step, matching DROID's continuous
+                         gripper-position action (and so is no longer an exact copy of the proprioception).
+  * Success gating    -> measured sim object poses (sim-truth).
 
 The script spans TWO venvs (the Isaac venv has no lerobot; the openpi venv has it). It has
 three modes, dispatched from ``main``:
@@ -375,6 +387,12 @@ def run_batch_rollout(env, obs, clients, instruction: str, max_steps: int, ep_di
     import torch
 
     from full_eval import _Mp4Writer
+    # Module-level obs functions: the real measured arm joints (7) and gripper opening (1, rescaled
+    # to [0,1]). We call them directly (not via the ObservationManager) so we log the clean measured
+    # articulation state -- the env's Gaussian observation noise is a policy-input augmentation, not
+    # part of the recorded ground-truth proprioception.
+    from src.sim_evals.environments.droid_environment import arm_joint_pos as _read_arm_joints
+    from src.sim_evals.environments.droid_environment import gripper_pos as _read_gripper
 
     n = len(clients)
     dev = env.unwrapped.device
@@ -384,6 +402,19 @@ def run_batch_rollout(env, obs, clients, instruction: str, max_steps: int, ep_di
     done = [False] * n  # plan fully executed
     failed = [False] * n  # planning/inference error
     ok = [False] * n
+    # Per-env sim data, appended in lockstep with each recorded camera frame.
+    sim_joint: list = [[] for _ in range(n)]  # MEASURED arm joint positions (7,) per frame (proprioception)
+    sim_grip: list = [[] for _ in range(n)]  # MEASURED gripper opening in [0,1] per frame (continuous)
+    sim_cmd: list = [[] for _ in range(n)]  # COMMANDED arm joint positions (7,) per frame (-> velocity action)
+
+    # Consistency guard: arm_joint_pos must enumerate panda_joint1..7 in the SAME order as the cuRobo
+    # plan / action term (which is what ret["action"][:7] is), else joint_position[k] (measured) and the
+    # velocity action[k] (forward-diff of commanded positions, plan order) would refer to different joints.
+    # Franka lists them in numeric order; fail loudly if a future asset reorders the DOFs.
+    _panda_order = [nm for nm in env.unwrapped.scene["robot"].data.joint_names if nm.startswith("panda_joint")]
+    assert _panda_order == [f"panda_joint{k}" for k in range(1, 8)], (
+        f"arm joint order {_panda_order} != panda_joint1..7; proprio/velocity columns would mismatch"
+    )
 
     def _hold(i):
         return torch.cat([obs["policy"]["arm_joint_pos"][i], obs["policy"]["gripper_pos"][i]])
@@ -408,6 +439,11 @@ def run_batch_rollout(env, obs, clients, instruction: str, max_steps: int, ep_di
     try:
         for step in range(int(max_steps)):
             actions = torch.zeros((n, 8), dtype=torch.float32, device=dev)
+            # Measured sim proprioception for this step, read BEFORE env.step so it is in lockstep
+            # with the camera frame captured below (same sim instant). These are the true articulation
+            # states (not the plan): arm joints (n,7) and the continuous gripper opening (n,) in [0,1].
+            arm_now = _read_arm_joints(env.unwrapped).detach().cpu().numpy()
+            grip_now = _read_gripper(env.unwrapped).detach().cpu().numpy().reshape(n)
             for i in range(n):
                 if done[i] or failed[i]:
                     actions[i] = _hold(i)  # hold the robot where it is
@@ -424,6 +460,9 @@ def run_batch_rollout(env, obs, clients, instruction: str, max_steps: int, ep_di
                         continue
                 for key, (_, _fname) in _CAMERAS.items():
                     writers[i][key].add(obs["policy"][key][i].detach().cpu().numpy())
+                sim_joint[i].append(arm_now[i].astype(np.float32))
+                sim_grip[i].append(np.float32(grip_now[i]))
+                sim_cmd[i].append(np.asarray(ret["action"], dtype=np.float32)[:7])  # commanded arm joints
                 frame_count[i] += 1
                 actions[i] = torch.as_tensor(ret["action"], dtype=torch.float32, device=dev)
 
@@ -439,6 +478,16 @@ def run_batch_rollout(env, obs, clients, instruction: str, max_steps: int, ep_di
         for w_set in writers:
             for w in w_set.values():
                 w.close()
+        # Persist the measured sim proprioception next to the camera mp4s so the LeRobot build uses
+        # true sim state (continuous gripper) instead of the plan. On success the prov dir is renamed
+        # to ep_NNN, carrying this file along; on failure the whole prov dir (incl. this file) is dropped.
+        for i in range(n):
+            np.savez(
+                ep_dirs[i] / "sim_state.npz",
+                joint_position=np.asarray(sim_joint[i], dtype=np.float32).reshape(-1, 7),
+                gripper_position=np.asarray(sim_grip[i], dtype=np.float32).reshape(-1),
+                cmd_joint_position=np.asarray(sim_cmd[i], dtype=np.float32).reshape(-1, 7),
+            )
     return ok, plan_steps, frame_count, obs
 
 
@@ -523,6 +572,13 @@ def run_worker(
             # which are env-independent (env origins differ only in XY).
             obs, _ = env.reset()
             obs, _ = env.reset()  # second render cycle for correct materials
+            # Single global dome for ambient (SceneCfg.global_dome); deactivate the per-env scene-USD
+            # DomeLight clones. N cloned infinite domes otherwise STACK their direct illumination and
+            # over-expose every env (brightness grew with num_envs, blowing out highlights), so a
+            # 128-env data frame no longer matches the single-env eval. With this, each env renders with
+            # one dome's worth of ambient -- num_envs-invariant and matching full_eval.
+            from src.sim_evals.environments.droid_environment import collapse_dome_lights
+            collapse_dome_lights()
             obs = settle_sim(env, obs, steps=settle_steps, reset_episode_buf=True)
             # Convert env 0's settled poses to env-LOCAL frame (the multi-env grid may not put
             # env 0 at the world origin). The sampler only reads z + plate quat (origin-free), but
@@ -759,11 +815,49 @@ def build_lerobot_dataset(
         if meta_path.is_file():
             task = json.loads(meta_path.read_text()).get("instruction", instruction)
 
-        pos50, vel50, grip50 = _dense_plan(plan)
-        m = len(pos50)
-        n = max(2, int(round(m * PLAN_DT * FPS)))  # 50 Hz -> 15 Hz
-        sel = _resample_indices(m, n)
-        pos, vel, grip = pos50[sel], vel50[sel], grip50[sel]
+        # State + action are taken from the MEASURED sim trajectory (sim_state.npz) on its NATIVE 15 Hz
+        # recorded-frame timeline (n = F frames). joint_position/gripper_position pass through 1:1 (true
+        # measured proprioception; the gripper is the continuous finger opening). The joint-velocity
+        # action is the per-frame forward difference of the COMMANDED joint positions (* FPS) -- i.e.
+        # the velocity actually executed each step: ~ZERO while the arm holds during a gripper open/close
+        # (the client commands the arm to hold its current pose, so the forward-diff is negligible) and
+        # the planned velocity during motion. This keeps the velocity action on the SAME timeline as the
+        # measured state (the plan timeline has no rows during gripper holds, so plan velocities would
+        # drift ahead of the state there). Finite-differencing the smooth *commanded* waypoints is safe;
+        # the 15-70x over-limit problem is only from differencing the *measured* (jittery) joints. The
+        # gripper action is the next-frame opening (continuous, leads the state by one 15 Hz step),
+        # matching DROID. Legacy raw episodes without sim_state.npz fall back to the old plan-derived
+        # (binary gripper, plan timeline) build so they still assemble, with a warning.
+        sim_path = ep / "sim_state.npz"
+        joint_pos = g_state = vel = None
+        from_sim_state = False
+        n = 0
+        if sim_path.is_file():
+            sd = np.load(sim_path)
+            sj = sd["joint_position"].astype(np.float32)
+            sg = sd["gripper_position"].astype(np.float32)
+            cj = sd["cmd_joint_position"].astype(np.float32) if "cmd_joint_position" in sd.files else None
+            if len(sj) >= 2 and cj is not None and len(cj) == len(sj):
+                n = len(sj)
+                joint_pos = sj
+                g_state = np.clip(sg, 0.0, 1.0)
+                dvel = (cj[1:] - cj[:-1]) * FPS  # commanded joint velocity at 15 Hz (~0 during holds)
+                vel = np.concatenate([dvel, np.zeros((1, 7), np.float32)], axis=0).astype(np.float32)
+                from_sim_state = True
+            else:
+                logger.warning(f"{ep.name}: sim_state.npz unusable (len={len(sj)}, cmd={None if cj is None else len(cj)}); falling back to plan state")
+        else:
+            logger.warning(f"{ep.name}: no sim_state.npz (legacy raw episode); falling back to plan-derived binary gripper")
+        if joint_pos is None:  # fallback: legacy plan-derived state (binary gripper) on the plan timeline
+            pos50, vel50, grip50 = _dense_plan(plan)
+            m = len(pos50)
+            n = max(2, int(round(m * PLAN_DT * FPS)))  # 50 Hz -> 15 Hz
+            sel = _resample_indices(m, n)
+            joint_pos = pos50[sel].astype(np.float32)
+            g_state = grip50[sel].astype(np.float32)
+            vel = vel50[sel].astype(np.float32)
+        # gripper position *command* = next-frame opening (continuous, leads the state by one frame)
+        g_action = np.concatenate([g_state[1:], g_state[-1:]]).astype(np.float32)
 
         decoded = {}
         missing = False
@@ -776,6 +870,14 @@ def build_lerobot_dataset(
             decoded[feat] = _decode_resized(str(mp4), _IMG_HW)
         if missing:
             continue
+        # On the sim_state path, camera frames are recorded in lockstep with the measured state (n = F),
+        # so len(frames) should equal n; warn on any divergence (e.g. an mp4 encoder drop) since it would
+        # desync images from the measured state. (Skipped on the legacy fallback, where n is plan-derived
+        # and differing from F is expected and handled by the resample.)
+        if from_sim_state:
+            for feat, frames in decoded.items():
+                if abs(len(frames) - n) > 2:
+                    logger.warning(f"{ep.name}: {feat} has {len(frames)} frames vs {n} state frames; resampling (possible image/state desync)")
         img_sel = {feat: _resample_indices(len(frames), n) for feat, frames in decoded.items()}
 
         for i in range(n):
@@ -784,9 +886,9 @@ def build_lerobot_dataset(
                     "exterior_image_1_left": decoded["exterior_image_1_left"][img_sel["exterior_image_1_left"][i]],
                     "exterior_image_2_left": decoded["exterior_image_2_left"][img_sel["exterior_image_2_left"][i]],
                     "wrist_image_left": decoded["wrist_image_left"][img_sel["wrist_image_left"][i]],
-                    "joint_position": pos[i],
-                    "gripper_position": grip[i : i + 1],
-                    "actions": np.concatenate([vel[i], grip[i : i + 1]]).astype(np.float32),
+                    "joint_position": joint_pos[i],
+                    "gripper_position": g_state[i : i + 1],
+                    "actions": np.concatenate([vel[i], g_action[i : i + 1]]).astype(np.float32),
                     "task": task,
                 }
             )
@@ -1095,7 +1197,7 @@ def main(
     d100_repo: str = "SamratSahoo/d100",
     merge_repo_id: str = "SamratSahoo/d100_toys100_sim",
     subset_merge_repo_id: str = "SamratSahoo/d100_toys20_sim",
-    num_envs: int = 256,  # parallel envs/batch — amortizes the dominant ~150s render; ~16GB on the 32GB 5090. With the perception-overlap server, planning no longer serializes badly at high N, so 24-32 is worth trying (watch VRAM + Gemini rate limits).
+    num_envs: int = 128,  # parallel envs/batch — amortizes the dominant ~150s render. 256 OOM'd the 32GB 5090 during scene load (crashed the host); 128 leaves headroom alongside the tiptop + M2T2 servers. With the perception-overlap server, planning no longer serializes badly at high N (watch VRAM + Gemini rate limits).
     max_steps_per_episode: int = 2400,
     max_attempts: int = 400,
     settle_steps: int = 120,

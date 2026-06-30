@@ -69,7 +69,20 @@ NVIDIA_DROID = ArticulationCfg(
                 joint_names_expr=["finger_joint"],
                 stiffness=1000.0,
                 damping=None,
-                velocity_limit=1.0,
+                # PhysX max joint velocity (rad/s) for the finger. For IMPLICIT actuators `velocity_limit`
+                # is IGNORED by the sim -- it must be `velocity_limit_sim` (which writes the PhysX
+                # set_dof_max_velocities). Without an enforced cap the stiff finger snaps shut in ~1 frame,
+                # so the recorded gripper proprioception/action was a binary {0,1} signal. Capping it makes
+                # the finger ramp over ~0.67 s (~10 frames @ 15 Hz), matching the DROID gripper's continuous
+                # transition distribution: swept 0.3-2.0 rad/s, 0.9 minimizes the 1-Wasserstein distance to
+                # DROID's per-step slew (0.043 vs 0.92 uncapped) and matches its ~10-frame median transition.
+                # The tiptop datagen holds the arm 20 frames per gripper action, so the finger fully
+                # actuates before the arm moves on.
+                # NOTE: 0.9 rad/s was TOO SLOW for the TAMP grasps — the gently-closing finger nudges the
+                # light photogrammetry toys away before trapping them, collapsing scene-6 success to ~0/32.
+                # Tuning for BOTH a continuous (non-binary) gripper AND reliable grasps -> see _sweep below;
+                # this value is the chosen tradeoff (still a multi-frame ramp, far from the 1-frame snap).
+                velocity_limit_sim=2.0,
             ),
         },
     )
