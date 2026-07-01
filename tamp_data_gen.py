@@ -15,18 +15,20 @@ Data representation (see plan / README):
                          (0 open, 1 closed), so it ramps smoothly (~0.8 s open<->close) instead of
                          snapping. This fixes the binary/bang-bang gripper that made fine-tuned
                          policies chatter the gripper open/closed.
-  * actions (8)       -> [7 joint velocities | 1 gripper position], on the SAME 15 Hz recorded-frame
-                         timeline as the proprioception. The 7 joint velocities are the per-frame forward
-                         difference of the COMMANDED joint positions (the cuRobo waypoint the client
-                         issued each step) -- i.e. the velocity actually executed: ~zero while the arm
-                         holds during a gripper open/close, the planned velocity during motion. (Finite-
+  * actions (8)       -> [7 joint velocities | 1 gripper command], straight from the TAMP plan, on the
+                         SAME 15 Hz recorded-frame timeline as the proprioception. The 7 joint velocities are
+                         the per-frame forward difference of the COMMANDED joint positions (the cuRobo waypoint
+                         the client issued each step) -- i.e. the velocity actually commanded: ~zero while the
+                         arm holds during a gripper open/close, the planned velocity during motion. (Finite-
                          differencing the *measured* position-controlled joints is *not* used -- it
                          yields velocities 15-70x over physical limits; the *commanded* waypoints are
                          smooth, so differencing them is fine, and unlike the raw plan velocities it
                          stays aligned with the measured state across gripper-hold frames.) The gripper
-                         action is the MEASURED next-frame finger opening -- a continuous gripper-position
-                         command that leads the state by one 15 Hz step, matching DROID's continuous
-                         gripper-position action (and so is no longer an exact copy of the proprioception).
+                         action is the PLAN's gripper command at that same frame (0 open / 1 close, the value
+                         the client issued to the sim) -- recorded ground truth, NO 1-frame lead and NOT a
+                         copy of the measured proprioception. (Proprioception is the measured finger opening;
+                         the action is the discrete plan command -- the two are now decoupled, which fixes the
+                         "policy never closes the gripper" failure where the action was an echo of the state.)
   * Success gating    -> measured sim object poses (sim-truth).
 
 The script spans TWO venvs (the Isaac venv has no lerobot; the openpi venv has it). It has
@@ -406,6 +408,7 @@ def run_batch_rollout(env, obs, clients, instruction: str, max_steps: int, ep_di
     sim_joint: list = [[] for _ in range(n)]  # MEASURED arm joint positions (7,) per frame (proprioception)
     sim_grip: list = [[] for _ in range(n)]  # MEASURED gripper opening in [0,1] per frame (continuous)
     sim_cmd: list = [[] for _ in range(n)]  # COMMANDED arm joint positions (7,) per frame (-> velocity action)
+    sim_cmd_grip: list = [[] for _ in range(n)]  # PLAN gripper command (0 open / 1 close) per frame (-> gripper action)
 
     # Consistency guard: arm_joint_pos must enumerate panda_joint1..7 in the SAME order as the cuRobo
     # plan / action term (which is what ret["action"][:7] is), else joint_position[k] (measured) and the
@@ -462,7 +465,9 @@ def run_batch_rollout(env, obs, clients, instruction: str, max_steps: int, ep_di
                     writers[i][key].add(obs["policy"][key][i].detach().cpu().numpy())
                 sim_joint[i].append(arm_now[i].astype(np.float32))
                 sim_grip[i].append(np.float32(grip_now[i]))
-                sim_cmd[i].append(np.asarray(ret["action"], dtype=np.float32)[:7])  # commanded arm joints
+                cmd_action = np.asarray(ret["action"], dtype=np.float32)
+                sim_cmd[i].append(cmd_action[:7])  # commanded arm joints (-> velocity action)
+                sim_cmd_grip[i].append(np.float32(cmd_action[7]))  # plan gripper command (0/1) this frame
                 frame_count[i] += 1
                 actions[i] = torch.as_tensor(ret["action"], dtype=torch.float32, device=dev)
 
@@ -487,6 +492,7 @@ def run_batch_rollout(env, obs, clients, instruction: str, max_steps: int, ep_di
                 joint_position=np.asarray(sim_joint[i], dtype=np.float32).reshape(-1, 7),
                 gripper_position=np.asarray(sim_grip[i], dtype=np.float32).reshape(-1),
                 cmd_joint_position=np.asarray(sim_cmd[i], dtype=np.float32).reshape(-1, 7),
+                cmd_gripper=np.asarray(sim_cmd_grip[i], dtype=np.float32).reshape(-1),
             )
     return ok, plan_steps, frame_count, obs
 
@@ -762,19 +768,21 @@ def build_lerobot_dataset(
     push: bool,
     private: bool,
     max_episodes: Optional[int] = None,
+    ep_start: int = 0,
 ) -> int:
     """Assemble successful episodes under ``out_dir`` into one DROID-schema LeRobot dataset.
 
-    ``max_episodes`` caps the number of (sorted, first-N) episode dirs used -- the way the
-    20-trajectory subset (toys20_sim) is built from the same raw episodes. Returns the
-    number of episodes written.
+    ``max_episodes`` caps the number of (sorted) episode dirs used; ``ep_start`` skips the first
+    ``ep_start`` dirs first -- so ``ep_start=S, max_episodes=C`` builds the slice ``[S, S+C)``. This
+    lets a large dataset be built in memory-bounded CHUNKS (each chunk in a fresh process), since
+    LeRobotDataset accumulates ~0.27 GB of anon RAM per episode and can't do 300 eps on a 30 GB host.
+    Returns the number of episodes written.
     """
     from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
     out_path = Path(out_dir)
     ep_dirs = sorted(p for p in out_path.glob("ep_*") if (p / "tiptop_plan.json").is_file())
-    if max_episodes is not None:
-        ep_dirs = ep_dirs[:max_episodes]
+    ep_dirs = ep_dirs[ep_start : (ep_start + max_episodes) if max_episodes is not None else None]
     if not ep_dirs:
         logger.error(f"No episodes with tiptop_plan.json under {out_path}")
         return 0
@@ -803,8 +811,12 @@ def build_lerobot_dataset(
         robot_type="panda",
         fps=FPS,
         features=_DROID_FEATURES,
-        image_writer_threads=10,
-        image_writer_processes=5,
+        # SYNCHRONOUS image writing (no async worker pool). The async pool (processes=5) buffers frames
+        # across episodes and balloons RAM at scale -- it OOM-killed the 300-episode toys300 build on this
+        # 30G host (even with the data-gen worker stopped). Writing each frame inline bounds peak RAM to
+        # ~one decoded episode (~1 GB); slower but it cannot OOM. Matches merge_datasets' writer config.
+        image_writer_threads=4,
+        image_writer_processes=0,
     )
 
     n_written = 0
@@ -815,21 +827,22 @@ def build_lerobot_dataset(
         if meta_path.is_file():
             task = json.loads(meta_path.read_text()).get("instruction", instruction)
 
-        # State + action are taken from the MEASURED sim trajectory (sim_state.npz) on its NATIVE 15 Hz
-        # recorded-frame timeline (n = F frames). joint_position/gripper_position pass through 1:1 (true
-        # measured proprioception; the gripper is the continuous finger opening). The joint-velocity
-        # action is the per-frame forward difference of the COMMANDED joint positions (* FPS) -- i.e.
-        # the velocity actually executed each step: ~ZERO while the arm holds during a gripper open/close
-        # (the client commands the arm to hold its current pose, so the forward-diff is negligible) and
-        # the planned velocity during motion. This keeps the velocity action on the SAME timeline as the
-        # measured state (the plan timeline has no rows during gripper holds, so plan velocities would
-        # drift ahead of the state there). Finite-differencing the smooth *commanded* waypoints is safe;
-        # the 15-70x over-limit problem is only from differencing the *measured* (jittery) joints. The
-        # gripper action is the next-frame opening (continuous, leads the state by one 15 Hz step),
-        # matching DROID. Legacy raw episodes without sim_state.npz fall back to the old plan-derived
-        # (binary gripper, plan timeline) build so they still assemble, with a warning.
+        # PROPRIOCEPTION (joint_position/gripper_position) is the MEASURED sim trajectory (sim_state.npz)
+        # on its NATIVE 15 Hz recorded-frame timeline (n = F frames): the true articulation states pass
+        # through 1:1 (the gripper is the continuous finger opening in [0,1]).
+        # ACTIONS come straight from the TAMP plan, frame-aligned to that timeline:
+        #   * joint velocity = per-frame forward difference of the COMMANDED joint positions (* FPS) -- the
+        #     velocity actually issued each step: ~ZERO while the arm holds during a gripper open/close (the
+        #     client commands the arm to hold its current pose, so the forward-diff is negligible) and the
+        #     planned velocity during motion. Finite-differencing the smooth *commanded* waypoints is safe;
+        #     the 15-70x over-limit problem is only from differencing the *measured* (jittery) joints, and
+        #     unlike the raw plan velocities the commanded diff stays aligned with the state across holds.
+        #   * gripper = the PLAN's gripper command at that same frame (0 open / 1 close, the value the client
+        #     issued to the sim), recorded verbatim -- NO 1-frame lead and NOT a copy of the measured proprio.
+        # Legacy raw episodes without sim_state.npz fall back to the plan-derived state (binary gripper,
+        # plan timeline) build so they still assemble, with a warning.
         sim_path = ep / "sim_state.npz"
-        joint_pos = g_state = vel = None
+        joint_pos = g_state = g_action = vel = None
         from_sim_state = False
         n = 0
         if sim_path.is_file():
@@ -837,15 +850,24 @@ def build_lerobot_dataset(
             sj = sd["joint_position"].astype(np.float32)
             sg = sd["gripper_position"].astype(np.float32)
             cj = sd["cmd_joint_position"].astype(np.float32) if "cmd_joint_position" in sd.files else None
+            cg = sd["cmd_gripper"].astype(np.float32) if "cmd_gripper" in sd.files else None
             if len(sj) >= 2 and cj is not None and len(cj) == len(sj):
                 n = len(sj)
                 joint_pos = sj
                 g_state = np.clip(sg, 0.0, 1.0)
+                if cg is not None and len(cg) == n:
+                    g_action = cg  # plan gripper command (0/1), same frame, no lead
+                else:
+                    # Legacy sim_state.npz predates cmd_gripper: keep measured proprio + plan velocity, but
+                    # the true per-frame plan gripper command is unavailable. Fall back to the same-frame
+                    # measured opening (no lead). Regenerate the raw episode to get the real plan command.
+                    logger.warning(f"{ep.name}: sim_state.npz has no cmd_gripper (legacy); gripper action = measured opening (regenerate for the plan command)")
+                    g_action = g_state
                 dvel = (cj[1:] - cj[:-1]) * FPS  # commanded joint velocity at 15 Hz (~0 during holds)
                 vel = np.concatenate([dvel, np.zeros((1, 7), np.float32)], axis=0).astype(np.float32)
                 from_sim_state = True
             else:
-                logger.warning(f"{ep.name}: sim_state.npz unusable (len={len(sj)}, cmd={None if cj is None else len(cj)}); falling back to plan state")
+                logger.warning(f"{ep.name}: sim_state.npz unusable (len={len(sj)}, cmd={None if cj is None else len(cj)}, cmd_grip={None if cg is None else len(cg)}); falling back to plan state")
         else:
             logger.warning(f"{ep.name}: no sim_state.npz (legacy raw episode); falling back to plan-derived binary gripper")
         if joint_pos is None:  # fallback: legacy plan-derived state (binary gripper) on the plan timeline
@@ -855,9 +877,9 @@ def build_lerobot_dataset(
             sel = _resample_indices(m, n)
             joint_pos = pos50[sel].astype(np.float32)
             g_state = grip50[sel].astype(np.float32)
+            g_action = grip50[sel].astype(np.float32)  # plan gripper command (binary), same frame, no lead
             vel = vel50[sel].astype(np.float32)
-        # gripper position *command* = next-frame opening (continuous, leads the state by one frame)
-        g_action = np.concatenate([g_state[1:], g_state[-1:]]).astype(np.float32)
+        g_action = g_action.astype(np.float32)  # plan gripper command, frame-aligned (no lead, not a proprio copy)
 
         decoded = {}
         missing = False
