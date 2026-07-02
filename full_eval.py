@@ -67,16 +67,16 @@ DEFAULT_INSTRUCTIONS = {
     4: "Put the cube on the mug and the cans in the bowl.",
     5: "Put 3 blocks in the bowl.",
     6: "Place the toys on the plate with no collisions",
-    7: "Push the yellow cube next to the red cube and push the blue cube next to the green cube",
+    7: "Push the yellow cube next to the red cube",
 }
 
 # Some tasks reuse another scene's geometry with a different instruction. Maps a task id
 # (used for the instruction and the output filenames) to the scene<N>_<variant>.usd loaded
-# for it; task ids not listed here load scene<id>_<variant>.usd as usual. Task 7 is a "push"
-# task over Scene 5's colored blocks (no bowl-placement goal), so it loads Scene 5's geometry.
-SCENE_GEOMETRY = {
-    7: "5",
-}
+# for it; task ids not listed here load scene<id>_<variant>.usd as usual. (Task 7 -- a "push
+# the yellow cube next to the red cube" task -- now has its OWN geometry: scene7_0.usd (the
+# scene6 empty base) + a scene7_0.json sidecar spawning a red + a yellow cube, so it is not
+# remapped here anymore.)
+SCENE_GEOMETRY = {}
 
 KNOWN_POLICIES = ("pi05", "tiptop")
 VIDEO_FPS = 15
@@ -195,6 +195,7 @@ def run_worker(
     pi05_port: int,
     tiptop_host: str,
     tiptop_port: int,
+    pi05_control_mode: str = "velocity",
 ) -> None:
     """Run one scene (one Isaac process) for the given policies; write per-policy mp4s."""
     from isaaclab.app import AppLauncher
@@ -260,9 +261,11 @@ def run_worker(
                 logger.info(f"[scene {worker_scene}] connecting pi-0.5 @ {pi05_host}:{pi05_port}")
                 client = Pi05WebsocketClient(host=pi05_host, port=pi05_port, open_loop_horizon=open_loop_horizon)
                 is_tiptop = False
-                # pi05_droid (and velocity-trained finetunes) emit joint velocities; the env
-                # integrates them onto the current joint position (see set_arm_control_mode).
-                rollout_mode = "velocity"
+                # Stock pi05_droid + velocity-trained finetunes emit joint velocities ("velocity":
+                # the env integrates them onto the current joint position). Joint-position policies
+                # (e.g. pi05_droid_jointpos_polaris) emit ABSOLUTE joint targets ("position").
+                # Selected per-run via --pi05-control-mode (see set_arm_control_mode).
+                rollout_mode = pi05_control_mode
             else:
                 logger.warning(f"Unknown policy '{policy}', skipping")
                 continue
@@ -572,6 +575,7 @@ def spawn_worker(scene: int, worker_policies: List[str], instruction: str, out_d
         "--pi05-port", str(worker_kwargs["pi05_port"]),
         "--tiptop-host", worker_kwargs["tiptop_host"],
         "--tiptop-port", str(worker_kwargs["tiptop_port"]),
+        "--pi05-control-mode", worker_kwargs["pi05_control_mode"],
     ]
     if not worker_kwargs["headless"]:
         cmd.append("--no-headless")
@@ -657,6 +661,7 @@ def run_orchestrator(
     pi05_port,
     tiptop_host,
     tiptop_port,
+    pi05_control_mode,
     pi05_label,
     tiptop_label,
     openpi_dir,
@@ -702,6 +707,7 @@ def run_orchestrator(
         pi05_port=pi05_port,
         tiptop_host=tiptop_host,
         tiptop_port=tiptop_port,
+        pi05_control_mode=pi05_control_mode,
     )
 
     pcfg = dict(
@@ -796,6 +802,7 @@ def main(
     pi05_port: int = 8000,
     tiptop_host: str = "localhost",
     tiptop_port: int = 8765,
+    pi05_control_mode: str = "velocity",
     pi05_label: str = "Pi-0.5",
     tiptop_label: str = "tiptop",
     openpi_dir: str = DEFAULT_OPENPI_DIR,
@@ -852,6 +859,7 @@ def main(
             pi05_port=pi05_port,
             tiptop_host=tiptop_host,
             tiptop_port=tiptop_port,
+            pi05_control_mode=pi05_control_mode,
         )
         return
 
@@ -871,6 +879,7 @@ def main(
         pi05_port=pi05_port,
         tiptop_host=tiptop_host,
         tiptop_port=tiptop_port,
+        pi05_control_mode=pi05_control_mode,
         pi05_label=pi05_label,
         tiptop_label=tiptop_label,
         openpi_dir=openpi_dir,

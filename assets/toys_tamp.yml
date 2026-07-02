@@ -1,0 +1,47 @@
+# cuTAMP environment mirroring the DROID sim "scene 6" toys task ("place the toys on the
+# plate with no collisions"). Three toys start scattered on the table; the goal is to place all
+# of them on the plate. This is a standalone cuTAMP TAMPEnvironment (loaded via
+# cutamp.envs.utils.load_env) used by tamp_plan_graph.py to produce a TAMP plan graph.
+#
+# Poses are [x, y, z, qw, qx, qy, qz] in meters. The table top sits at z = 0.
+name: toys_tamp
+
+geometries:
+  cuboid:
+    # Movable toys (~4.5 cm, matching scene6 asset scale). Resting on the table (z = half-height).
+    blue_toy:
+      color: [33, 150, 243]
+      dims: [0.05, 0.05, 0.05]
+      pose: [0.45, -0.28, 0.025, 1.0, 0.0, 0.0, 0.0]
+    brown_toy:
+      color: [121, 85, 72]
+      dims: [0.05, 0.05, 0.05]
+      pose: [0.40, 0.30, 0.025, 0.92, 0.0, 0.0, 0.39]
+    pink_toy:
+      color: [233, 30, 99]
+      dims: [0.05, 0.05, 0.05]
+      pose: [0.58, 0.05, 0.025, 0.71, 0.0, 0.0, 0.71]
+
+    # Static table surface. Top face at z = 0.
+    table:
+      color: [200, 180, 150]
+      dims: [1.20, 0.90, 0.04]
+      pose: [0.45, 0.0, -0.02, 1.0, 0.0, 0.0, 0.0]
+
+  cylinder:
+    # The plate: the goal placement surface. Thin disc centered in the workspace.
+    plate:
+      color: [224, 224, 224]
+      radius: 0.13
+      height: 0.012
+      pose: [0.50, 0.0, 0.006, 1.0, 0.0, 0.0, 0.0]
+
+types:
+  Movable: [blue_toy, brown_toy, pink_toy]
+  Surface: [table, plate]
+
+goal:
+  - "On": [blue_toy, plate]
+  - "On": [brown_toy, plate]
+  - "On": [pink_toy, plate]
+  - HandEmpty: []

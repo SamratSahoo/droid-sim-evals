@@ -285,6 +285,40 @@ class SceneCfg(InteractiveSceneCfg):
                 ))
                 continue
 
+            if kind == "box":
+                # A simple colored rigid cuboid spawned via Isaac's native cuboid mesh path
+                # (no mesh asset needed) -- used by scene 7's two separated push cubes. Same
+                # physics knobs as the "rigid" branch; a box is convex so the default
+                # convexHull collider is exact.
+                size = tuple(obj.get("size", (0.05, 0.05, 0.05)))
+                rp = obj.get("rigid", {})
+                spawn = sim_utils.MeshCuboidCfg(
+                    size=size,
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        kinematic_enabled=obj.get("kinematic", False),
+                        max_depenetration_velocity=rp.get("max_depenetration_velocity", 1.0),
+                        solver_position_iteration_count=rp.get("solver_iters", 32),
+                    ),
+                    collision_props=sim_utils.CollisionPropertiesCfg(),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=obj.get("mass", 0.05)),
+                    physics_material=sim_utils.RigidBodyMaterialCfg(
+                        static_friction=rp.get("static_friction", 0.6),
+                        dynamic_friction=rp.get("dynamic_friction", 0.5),
+                        restitution=rp.get("restitution", 0.0),
+                    ),
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=tuple(obj.get("color", (0.7, 0.7, 0.7))),
+                        roughness=0.6,
+                        metallic=0.0,
+                    ),
+                )
+                setattr(self, name, RigidObjectCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/{name}",
+                    spawn=spawn,
+                    init_state=RigidObjectCfg.InitialStateCfg(pos=pos, rot=rot),
+                ))
+                continue
+
             mesh_path = str((DATA_PATH / obj["mesh"]).resolve())
             visual = sim_utils.PreviewSurfaceCfg(
                 diffuse_color=tuple(obj.get("color", (0.7, 0.7, 0.7))),

@@ -1,0 +1,31 @@
+{
+  "_comment": "Sidecar for scene7_0.usd (a copy of the scene6 empty base: table + dome + robot). Objects spawned programmatically by SceneCfg.dynamic_scene via kind='box' (isaaclab MeshCuboidCfg) -- see src/sim_evals/environments/droid_environment.py::_add_sidecar_objects. Scene 7 is the 'push' task: a red cube and a yellow cube resting on the table, NOT touching. Instruction (full_eval DEFAULT_INSTRUCTIONS[7]): 'Push the yellow cube next to the red cube'. Poses are world meters; the table-top collider surface sits at z~=0.045, so a 0.05 m cube (center at z=size/2 above the top) is placed at z=0.075 (base ~5 mm above the top, settles on contact) -- mirrors scene6's plate at z=0.05. Both cubes sit in the wrist-camera FOV (roughly x in [0.30,0.58], y in [-0.08,0.26]) where scenes 1-6 place their objects; they are separated ~0.18 m in y (~0.13 m gap) so the yellow cube must be pushed toward the red one.",
+  "objects": [
+    {
+      "name": "red_cube",
+      "kind": "box",
+      "size": [0.05, 0.05, 0.05],
+      "pos": [0.45, 0.18, 0.075],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.8, 0.05, 0.05],
+      "mass": 0.05,
+      "rigid": {
+        "static_friction": 0.6,
+        "dynamic_friction": 0.5
+      }
+    },
+    {
+      "name": "yellow_cube",
+      "kind": "box",
+      "size": [0.05, 0.05, 0.05],
+      "pos": [0.45, 0.0, 0.075],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.95, 0.85, 0.1],
+      "mass": 0.05,
+      "rigid": {
+        "static_friction": 0.6,
+        "dynamic_friction": 0.5
+      }
+    }
+  ]
+}
