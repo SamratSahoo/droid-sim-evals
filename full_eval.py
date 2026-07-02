@@ -45,7 +45,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 logger = logging.getLogger("full_eval")
 
 import cv2
-import mediapy
+try:
+    import mediapy
+except ImportError:  # optional: _Mp4Writer falls back to cv2 when mediapy is absent (e.g. Isaac container)
+    mediapy = None
 import numpy as np
 import tyro
 

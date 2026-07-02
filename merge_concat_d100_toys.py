@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME  # noqa: E402
 
 D100_REPO = "SamratSahoo/d100"
-SCRATCH = Path(__file__).resolve().parent / "runs" / "tamp_data" / "_concat_scratch"
+SCRATCH = Path(__file__).resolve().parent / "runs" / "tamp_data" / f"_concat_scratch_{os.getpid()}"
 
 
 def _read_jsonl(p):
