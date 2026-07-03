@@ -1,0 +1,64 @@
+# Default config for slurm/datagen_8gpu_neuronic.slurm
+#
+# Runtime knobs for the 8-GPU scene-6 TAMP data-gen. Override any subset by copying this file,
+# editing it, and passing it as the script's first arg:
+#
+#     sbatch slurm/datagen_8gpu_neuronic.slurm cfg/my_run.yml
+#
+# A user file need only set the keys it changes (it is deep-merged over these defaults).
+# NOTE: cluster RESOURCE requests (gpu/mem/time/exclusive) are #SBATCH directives parsed by sbatch
+# BEFORE the script runs, so they are NOT set here -- override them with `sbatch --mem=... -t ...`
+# or by editing the header. Everything below is a runtime environment knob (UPPERCASED as an env
+# var for the script).
+
+total_episodes: 300      # target number of successful trajectories, split across GPUs
+num_gpus: 8              # one worker+tiptop+M2T2 trio per GPU
+num_envs: 128            # parallel Isaac envs per instance (fits a 46GB L40 alongside the servers)
+max_attempts: 2000       # cap on randomized attempts per instance (scene-6 success rate is low)
+scene: 6
+variant: 0
+
+# Ports / server readiness (rarely changed).
+m2t2_port: 8123               # must be 8123: tiptop's m2t2.url is hardcoded to localhost:8123
+tiptop_port_base: 8765
+server_timeout: 1800          # per-server readiness wait, seconds (cuRobo warmup can take minutes)
+worker_stagger: 15            # seconds between worker starts (avoid Isaac-Kit init races)
+
+# out_root: (optional) raw-episode output dir. Leave unset to default to
+#           runs/tamp_data/job_<SLURM_JOB_ID> inside droid-sim-evals.
+# out_root: /n/fs/tamp-vla/tamp-vla/droid-sim-evals/runs/tamp_data/my_run
+
+# ---------------------------------------------------------------------------------------------
+# TAMP parameters (cuRobo cost overrides) applied to EVERY plan this job's tiptop servers make.
+# This is how you data-gen with a chosen manifold / novelty / smoothness regime: fill in keys and
+# the resulting dataset reflects those tamp params. Keys match tiptop.motion_planning
+# .apply_cost_overrides (same names the parameter sweep + tiptop-viz UI use). Written to a JSON
+# sidecar and passed to each server as `--curobo-overrides`.
+#
+# Leave the mapping EMPTY (the default below) for stock behavior identical to prior runs.
+tamp_overrides: {}
+#
+# Example -- the RND-novelty regime from the sweep (maximize novelty against a DROID-style pull):
+# tamp_overrides:
+#   vae_manifold_weight: 5000            # pull motion TOWARD the DROID manifold
+#   rnd_novelty_weight: 100000           # push toward regions DROID does NOT cover (log-novelty cost)
+#   rnd_novelty_log: true                # maximize log(novelty) (bounded) instead of raw novelty
+#   time_dilation_factor_literal: 0.5    # apply a real 0.5 dilation (bypasses the 1.0 sentinel)
+#
+# Other available knobs (all optional; see apply_cost_overrides):
+#   uniform_velocity_weight: 0.0
+#   self_collision_weight: 5000
+#   cspace_weight: 20000
+#   primitive_collision_activation_distance: 0.025
+#   run_weight_acceleration: 0.5
+#   run_weight_jerk: 0.5
+#   run_vec_weight: 0.3
+#   velocity_scale: 1.0                  # joint velocity-limit scale
+#   acceleration_scale: 1.0
+#   jerk_scale: 1.0
+#   horizon: 32                          # trajopt timesteps
+#   base_dt: 0.06666
+#   smooth_weight: {1: 10000.0, 2: 5.0}  # per-index bound_cfg.smooth_weight
+#   bound_weight: {0: 100000.0}          # per-index bound_cfg.weight
+#   bound_activation_distance: {1: 0.05} # per-index bound_cfg.activation_distance
+#   pose_weight: {2: 100.0}              # per-index pose_cfg.weight

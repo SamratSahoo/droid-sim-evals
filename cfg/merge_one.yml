@@ -1,0 +1,5 @@
+# Default config for slurm/merge_one.slurm — merge d100 (local cache) + a toys set -> out repo.
+# Requires d100 already cached (run slurm/fetch_d100.slurm first).
+# Override:  sbatch slurm/merge_one.slurm cfg/my_merge.yml
+toys_repo: SamratSahoo/toys100_sim
+out_repo: SamratSahoo/d100_toys100_sim

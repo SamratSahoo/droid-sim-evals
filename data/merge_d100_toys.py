@@ -1,7 +1,7 @@
 """Low-memory merge of d100 (local) + a toys{N}_sim dataset (streamed from the Hub) -> d100_toys{N}_sim.
 
-Parameterized generalization of merge_concat_d100_toys300.py. The add_frame-based merge re-encodes
-every image and OOM-kills at ~400 episodes on this 30G host; this CONCATENATES parquet files instead:
+The add_frame-based merge (tamp_data_gen.merge_datasets) re-encodes every image and OOM-kills at
+~400 episodes on this 30G host; this CONCATENATES parquet files instead:
   * d100's episode parquets are copied VERBATIM (their episode/task/global-index values are already
     correct, since d100 comes first and keeps task_index 0..N).
   * the toys set's parquets are streamed from the Hub one at a time; only 3 scalar int columns are
@@ -9,7 +9,7 @@ every image and OOM-kills at ~400 episodes on this 30G host; this CONCATENATES p
     the inline-image struct column is carried over untouched (no decode/encode). Peak RSS ~one parquet.
 
 Usage (openpi venv):
-  ../openpi/.venv/bin/python merge_concat_d100_toys.py --toys-repo SamratSahoo/toys20_sim \
+  ../openpi/.venv/bin/python merge_d100_toys.py --toys-repo SamratSahoo/toys20_sim \
       --out-repo SamratSahoo/pi05droid_d100_toys20_sim [--push]
 """
 import argparse
@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME  # noqa: E402
 
 D100_REPO = "SamratSahoo/d100"
-SCRATCH = Path(__file__).resolve().parent / "runs" / "tamp_data" / f"_concat_scratch_{os.getpid()}"
+SCRATCH = Path(__file__).resolve().parents[1] / "runs" / "tamp_data" / f"_concat_scratch_{os.getpid()}"
 
 
 def _read_jsonl(p):

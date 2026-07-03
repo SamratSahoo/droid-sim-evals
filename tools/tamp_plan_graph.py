@@ -36,8 +36,9 @@ from pathlib import Path
 _log = logging.getLogger("tamp_plan_graph")
 
 _HERE = Path(__file__).resolve().parent
-_DEFAULT_ENV = _HERE / "assets" / "toys_tamp.yml"
-_DEFAULT_CUTAMP_ROOT = _HERE.parent / "cuTAMP"
+_ROOT = _HERE.parent  # droid-sim-evals (this script lives in tools/)
+_DEFAULT_ENV = _ROOT / "assets" / "toys_tamp.yml"
+_DEFAULT_CUTAMP_ROOT = _ROOT.parent / "cuTAMP"
 
 
 def _add_cutamp_to_path(cutamp_root: Path) -> None:
@@ -154,7 +155,7 @@ def run_full_solve(env_path: Path, out_dir: Path, args: argparse.Namespace) -> N
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--env", type=Path, default=_DEFAULT_ENV, help="Path to the toys cuTAMP env YAML")
-    parser.add_argument("--out", type=Path, default=_HERE / "runs" / "toys_plan_graph", help="Output directory")
+    parser.add_argument("--out", type=Path, default=_ROOT / "runs" / "toys_plan_graph", help="Output directory")
     parser.add_argument("--cutamp-root", type=Path, default=_DEFAULT_CUTAMP_ROOT, help="Path to the cuTAMP repo")
     parser.add_argument(
         "--skeleton-only",

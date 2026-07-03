@@ -122,7 +122,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 uv run scripts/serve_policy.py policy:checkpo
 
 Finally, run the evaluation script:
 ```bash
-python tiptop_eval.py --scene <scene_id> --variant <variant_id> --instruction "<instruction>"
+python eval/tiptop_eval.py --scene <scene_id> --variant <variant_id> --instruction "<instruction>"
 ```
 
 ## Minimal Example
@@ -163,16 +163,16 @@ itself**. It picks how to schedule them based on available VRAM:
 
 ```bash
 # all 5 scenes (variant 0), auto server scheduling
-uv run python full_eval.py
+uv run python eval/full_eval.py
 
 # force one-at-a-time (e.g. single 24-32 GB GPU); single scene
-uv run python full_eval.py --mode alternating --scenes 1
+uv run python eval/full_eval.py --mode alternating --scenes 1
 
 # servers already running -> just connect, run, and stitch
-uv run python full_eval.py --no-launch-servers
+uv run python eval/full_eval.py --no-launch-servers
 
 # re-build comparison videos from existing per-policy mp4s (no GPU needed)
-uv run python full_eval.py --stitch-only --out-dir runs/<date>/<time>
+uv run python eval/full_eval.py --stitch-only --out-dir runs/<date>/<time>
 ```
 
 Outputs land in `runs/<date>/<time>/`:
@@ -191,7 +191,7 @@ phase and kills it after (`--launch-perception`, on by default; set up under
 
 ```bash
 export GEMINI_API_KEY=...           # tiptop perception (Gemini Robotics-ER)
-uv run python full_eval.py          # M2T2 is launched/killed for you
+uv run python eval/full_eval.py          # M2T2 is launched/killed for you
 ```
 
 FoundationStereo (`../FoundationStereo`) is **not** required in sim — the tiptop

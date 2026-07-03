@@ -21,10 +21,10 @@ cube" task -- two separated cubes built the same way scene 6 is (an empty base U
 ``assets/scene7_0.json`` sidecar; see droid_environment.py::_add_sidecar_objects).
 
 Run with the eval venv python (cu128 torch), from the droid-sim-evals dir:
-    PI05_DEBUG_DUMP=1 .venv/bin/python run_pi05_eval_v2.py
+    PI05_DEBUG_DUMP=1 .venv/bin/python eval_pi05_policies.py
 Optionally restrict to a subset of policies and/or scenes (e.g. re-run only the cubes task
 for three policies after changing scene 7, leaving the toys outputs untouched):
-    PI05_DEBUG_DUMP=1 .venv/bin/python run_pi05_eval_v2.py \
+    PI05_DEBUG_DUMP=1 .venv/bin/python eval_pi05_policies.py \
         --policies pi05_droid_jointpos_polaris pi05_droid_base pi05droid_toys100_sim --scenes 7
 """
 
@@ -53,12 +53,13 @@ log = logging.getLogger("pi05_eval_v2")
 for _noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3", "filelock"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-_SCRIPT_DIR = Path(__file__).resolve().parent          # droid-sim-evals/
-_REPO_ROOT = _SCRIPT_DIR.parent                        # tamp-vla/
-_VENV_PY = _SCRIPT_DIR / ".venv" / "bin" / "python"
+_SCRIPT_DIR = Path(__file__).resolve().parent          # droid-sim-evals/eval
+_DSE_DIR = _SCRIPT_DIR.parent                          # droid-sim-evals/
+_REPO_ROOT = _DSE_DIR.parent                           # tamp-vla/
+_VENV_PY = _DSE_DIR / ".venv" / "bin" / "python"
 _CKPT_ROOT = _REPO_ROOT / "openpi" / "checkpoints"     # local download target
 _HF_HUB = Path.home() / ".cache" / "huggingface" / "hub"
-_OUT_ROOT = _SCRIPT_DIR / "runs" / "pi05-eval-v2"
+_OUT_ROOT = _DSE_DIR / "runs" / "pi05-eval-v2"
 
 # scene id -> output task folder name + instruction (matches full_eval DEFAULT_INSTRUCTIONS)
 TASKS = {
@@ -76,9 +77,11 @@ POLICIES = [
     ("pi05droid_d100_toys20_sim",  "SamratSahoo/pi05droid_d100_toys20_sim",  "pi05droid-full-d100+toys20sim",  None, "velocity"),
     ("pi05droid_toys100_sim",      "SamratSahoo/pi05droid_toys100_sim",      "pi05droid-toys100sim",           None, "velocity"),
     ("pi05droid_toys20_sim",       "SamratSahoo/pi05droid_toys20_sim",       "pi05droid-toys20sim",            None, "velocity"),
-    # Full finetune of pi05_BASE on DROID-100 (own norm stats, bundled at
-    # assets/SamratSahoo/d100/norm_stats.json -- NOT the DROID norm stats the pi05droid_* configs reuse).
+    # Full finetunes of pi05_BASE (own norm stats bundled at assets/SamratSahoo/<repo>/norm_stats.json
+    # -- NOT the DROID norm stats the pi05droid_* configs reuse).
     ("pi05base_d100",              "SamratSahoo/pi05base_d100",              "pi05base-full-d100",             None, "velocity"),
+    ("pi05base_d100_toys100_sim",  "SamratSahoo/pi05base_d100_toys100_sim",  "pi05base-full-d100+toys100sim",  None, "velocity"),
+    ("pi05base_d100_toys20_sim",   "SamratSahoo/pi05base_d100_toys20_sim",   "pi05base-full-d100+toys20sim",   None, "velocity"),
     ("pi05_droid_base",            None, "pi05_droid",
      "gs://openpi-assets/checkpoints/pi05_droid", "velocity"),
     ("pi05_droid_jointpos_polaris", None, "pi05_droid_jointpos_polaris",
@@ -131,7 +134,7 @@ def _run_full_eval(config: str, checkpoint: str, staging: Path, control_mode: st
     """Run full_eval.py for pi05 only on the given task scenes; returns exit code."""
     staging.mkdir(parents=True, exist_ok=True)
     cmd = [
-        str(_VENV_PY), "full_eval.py",
+        str(_VENV_PY), str(_SCRIPT_DIR / "full_eval.py"),
         "--policies", "pi05",
         "--mode", "alternating",
         "--no-launch-perception",
@@ -145,7 +148,7 @@ def _run_full_eval(config: str, checkpoint: str, staging: Path, control_mode: st
     env["PI05_DEBUG_DUMP"] = "1"
     env.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
     log.info("running full_eval: " + " ".join(cmd))
-    return subprocess.run(cmd, cwd=str(_SCRIPT_DIR), env=env).returncode
+    return subprocess.run(cmd, cwd=str(_DSE_DIR), env=env).returncode
 
 
 def _npz_to_npy(npz_path: Path, npy_path: Path, instruction: str, control_mode: str) -> bool:

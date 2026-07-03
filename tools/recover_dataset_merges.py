@@ -4,6 +4,8 @@ import json, shutil, sys
 from pathlib import Path
 from huggingface_hub import HfApi, hf_hub_download
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "data"))  # for `import tamp_data_gen` (in data/)
 import tamp_data_gen as T
 
 api = HfApi()

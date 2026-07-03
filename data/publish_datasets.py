@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[1]  # droid-sim-evals root (runs/ lives here, not in data/)
 os.chdir(HERE)
 RAW = HERE / "runs" / "tamp_data" / "job_3478916"
 ALL = HERE / "runs" / "tamp_data" / "all300"
@@ -75,7 +75,7 @@ for pure, out in [("SamratSahoo/toys20_sim", "SamratSahoo/d100_toys20_sim"),
                   ("SamratSahoo/toys100_sim", "SamratSahoo/d100_toys100_sim"),
                   ("SamratSahoo/toys300_sim", "SamratSahoo/d100_toys300_sim")]:
     print(f"\n===== MERGE+PUSH {out} (d100 + {pure}) =====", flush=True)
-    rc = subprocess.run([sys.executable, "merge_concat_d100_toys.py",
+    rc = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "merge_d100_toys.py"),
                          "--toys-repo", pure, "--out-repo", out, "--push"]).returncode
     if rc != 0:
         sys.exit(f"MERGE FAILED {out}")

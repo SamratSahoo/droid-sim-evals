@@ -17,45 +17,62 @@
 #   * 1 shared M2T2 grasp server on GPU 0 :8123   (tiptop's perception.m2t2.url is hardcoded to
 #     localhost:8123, and M2T2 is a stateless grasp predictor, so all tiptop servers share it)
 #   * 8 tiptop planning servers, server i pinned to GPU i on port 8765+i
-#   * 8 Isaac workers (tamp_data_gen.py --worker), worker i pinned to GPU i, writing gpu_i/
+#   * 8 Isaac workers (data/tamp_data_gen.py --worker), worker i pinned to GPU i, writing gpu_i/
 # GPU isolation is via CUDA_VISIBLE_DEVICES (every component hardcodes device 0, so each instance
 # sees its assigned GPU as cuda:0). Servers are torn down on exit. Raw episodes only (no HF push);
 # the LeRobot build/merge command is printed at the end.
 #
-# Submit:   sbatch droid-sim-evals/datagen_8gpu_neuronic.slurm
-# Override: TOTAL_EPISODES=300 NUM_ENVS=64 sbatch ... (via --export or env)
+# Submit:   sbatch slurm/datagen_8gpu_neuronic.slurm                     # cfg/datagen_8gpu_neuronic.yml defaults
+#           sbatch slurm/datagen_8gpu_neuronic.slurm cfg/my_run.yml      # overlay a user config (incl. tamp params)
+# All runtime knobs (episodes, envs, ports, and the cuRobo/TAMP cost overrides applied to every
+# plan) live in the YAML config, NOT here. See cfg/datagen_8gpu_neuronic.yml.
 
 set -uo pipefail
-
-# ---- config (override via environment) ------------------------------------
-TOTAL_EPISODES="${TOTAL_EPISODES:-300}"
-NUM_GPUS="${NUM_GPUS:-8}"
-NUM_ENVS="${NUM_ENVS:-128}"         # parallel Isaac envs per instance. 128 matches the proven 5090
-                                    # single-GPU config and fits the 46GB L40 (trio worker+tiptop+M2T2,
-                                    # same as the 5090 did on 32GB). Was 64 (conservative).
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-2000}" # cap on randomized attempts per instance. Scene-6 success rate is
-                                     # low (run_datagen.sh budgeted ~3600 attempts/100 successes), so give
-                                     # plenty of headroom; the worker stops early once it hits its N, and
-                                     # is resume-safe (recounts ep_* and continues) if walltime is hit.
-SCENE="${SCENE:-6}"
-VARIANT="${VARIANT:-0}"
-M2T2_PORT="${M2T2_PORT:-8123}"      # must be 8123: tiptop's m2t2.url is hardcoded to localhost:8123
-TIPTOP_PORT_BASE="${TIPTOP_PORT_BASE:-8765}"
-SERVER_TIMEOUT="${SERVER_TIMEOUT:-1800}"  # per-server readiness wait (cuRobo warmup can take minutes)
-WORKER_STAGGER="${WORKER_STAGGER:-15}"    # seconds between worker starts (avoid Isaac-Kit init races)
 
 REPO_ROOT="/n/fs/tamp-vla/tamp-vla"
 DSE_DIR="$REPO_ROOT/droid-sim-evals"
 M2T2_DIR="$REPO_ROOT/M2T2"
 TIPTOP_DIR="$REPO_ROOT/tiptop"
-OUT_ROOT="${OUT_ROOT:-$DSE_DIR/runs/tamp_data/job_${SLURM_JOB_ID:-manual}}"
-LOG_DIR="$OUT_ROOT/logs"
-mkdir -p "$LOG_DIR"
 
 # ---- environment ----------------------------------------------------------
 # shellcheck disable=SC1090
 set +u; source "$HOME/.bashrc"; set -u   # (/etc/bashrc trips `set -u`); brings GEMINI_API_KEY, HF_*, PIXI_CACHE_DIR, pixi PATH
 export PATH="$HOME/.pixi/bin:$PATH"
+
+# ---- config (cfg/<name>.yml defaults, overlaid by the optional $1 user YAML) -----------------
+# The loader emits `export UPPER_KEY=...` for each scalar and, if tamp_overrides is non-empty,
+# writes them to a JSON sidecar and exports TAMP_OVERRIDES_JSON (passed to each tiptop server).
+CFG_DEFAULT="$DSE_DIR/cfg/datagen_8gpu_neuronic.yml"
+CFG_USER="${1:-}"
+LOADER_PY="$DSE_DIR/.venv/bin/python"    # dse venv has pyyaml; on the project FS (mounted on nodes)
+OVERRIDES_JSON="$DSE_DIR/runs/tamp_overrides_${SLURM_JOB_ID:-manual}.json"
+eval "$("$LOADER_PY" "$DSE_DIR/slurm/lib/load_config.py" \
+        --default "$CFG_DEFAULT" ${CFG_USER:+--config "$CFG_USER"} \
+        --overrides-out "$OVERRIDES_JSON")"
+
+# Fallbacks so the script still runs if a key is absent from the merged config.
+TOTAL_EPISODES="${TOTAL_EPISODES:-300}"
+NUM_GPUS="${NUM_GPUS:-8}"
+NUM_ENVS="${NUM_ENVS:-128}"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-2000}"
+SCENE="${SCENE:-6}"
+VARIANT="${VARIANT:-0}"
+M2T2_PORT="${M2T2_PORT:-8123}"           # must be 8123: tiptop's m2t2.url is hardcoded to localhost:8123
+TIPTOP_PORT_BASE="${TIPTOP_PORT_BASE:-8765}"
+SERVER_TIMEOUT="${SERVER_TIMEOUT:-1800}"
+WORKER_STAGGER="${WORKER_STAGGER:-15}"
+OUT_ROOT="${OUT_ROOT:-$DSE_DIR/runs/tamp_data/job_${SLURM_JOB_ID:-manual}}"
+LOG_DIR="$OUT_ROOT/logs"
+mkdir -p "$LOG_DIR"
+
+# Per-server cuRobo cost-override flag (empty unless the config set tamp_overrides). Keep the JSON
+# with the run for provenance.
+TIPTOP_OVERRIDE_ARG=""
+if [ -n "${TAMP_OVERRIDES_JSON:-}" ] && [ -s "${TAMP_OVERRIDES_JSON}" ]; then
+  TIPTOP_OVERRIDE_ARG="--curobo-overrides $TAMP_OVERRIDES_JSON"
+  cp "$TAMP_OVERRIDES_JSON" "$LOG_DIR/tamp_overrides.json" 2>/dev/null || true
+  echo "=== TAMP overrides: $(tr -d '\n ' < "$TAMP_OVERRIDES_JSON") ==="
+fi
 export OMNI_KIT_ACCEPT_EULA=YES     # Isaac Sim EULA (headless: no TTY to answer the prompt)
 : "${GEMINI_API_KEY:?GEMINI_API_KEY not set (tiptop perception needs it; it is in ~/.bashrc)}"
 # Thread discipline: up to ~16 CPU-heavy procs (8 tiptop + 8 workers) share this 104-core node.
@@ -124,7 +141,7 @@ done
 for ((i = 0; i < NUM_GPUS; i++)); do
   port=$((TIPTOP_PORT_BASE + i))
   echo "=== launching tiptop server $i on GPU$i :$port (M2T2 :$((M2T2_PORT + i)), staggered) ==="
-  setsid bash -c "cd '$TIPTOP_DIR' && exec env CUDA_VISIBLE_DEVICES=$i TIPTOP_M2T2_PORT=$((M2T2_PORT + i)) pixi run python -m tiptop.tiptop_websocket_server --port $port" \
+  setsid bash -c "cd '$TIPTOP_DIR' && exec env CUDA_VISIBLE_DEVICES=$i TIPTOP_M2T2_PORT=$((M2T2_PORT + i)) pixi run python -m tiptop.tiptop_websocket_server --port $port $TIPTOP_OVERRIDE_ARG" \
     > "$LOG_DIR/tiptop_$i.log" 2>&1 &
   SERVER_PIDS+=("$!")
   wait_tcp 127.0.0.1 "$port" "$SERVER_TIMEOUT" "tiptop_$i" || { echo "tiptop_$i failed; see $LOG_DIR/tiptop_$i.log"; tail -20 "$LOG_DIR/tiptop_$i.log"; exit 1; }
@@ -153,7 +170,7 @@ for ((i = 0; i < NUM_GPUS; i++)); do
       --bind /n/fs/tamp-vla,"$kd/data":/isaac-sim/kit/data,"$kd/cache":/isaac-sim/kit/cache,"$kd/logs":/isaac-sim/kit/logs \
       --pwd "$DSE_DIR" \
       --env PYTHONPATH="$DEPS:$OPC",OMNI_KIT_ACCEPT_EULA=YES,CUDA_VISIBLE_DEVICES=$i,OMP_NUM_THREADS=8,MKL_NUM_THREADS=8 \
-      "$SIF" /isaac-sim/python.sh -u tamp_data_gen.py --worker \
+      "$SIF" /isaac-sim/python.sh -u data/tamp_data_gen.py --worker \
         --scene "$SCENE" --variant "$VARIANT" \
         --tiptop-host 127.0.0.1 --tiptop-port "$port" --num-tiptop-servers 1 \
         --num-envs "$NUM_ENVS" --num-episodes "$n" --max-attempts "$MAX_ATTEMPTS" \
@@ -178,6 +195,6 @@ echo "=================================================================="
 echo "=== DONE: collected $TOTAL_GOT / $TOTAL_EPISODES trajectories ==="
 echo "=== raw episodes under: $OUT_ROOT/gpu_{0..$((NUM_GPUS - 1))} ==="
 echo "=== To build+push a single LeRobot dataset (openpi venv), consolidate then build, e.g.:"
-echo "===   python droid-sim-evals/merge_concat_d100_toys300.py   # or build_lerobot over the gathered eps"
+echo "===   python droid-sim-evals/data/merge_d100_toys.py --toys-repo <repo> --out-repo <repo> --push   # or build_lerobot over the gathered eps"
 echo "=================================================================="
 exit $rc_total

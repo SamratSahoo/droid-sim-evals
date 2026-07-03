@@ -1,12 +1,12 @@
 """Build + push ONE pure toys LeRobot dataset from the shared all300 dir, then delete the local build.
-Usage (openpi venv):  build_one.py <repo_id> <max_episodes|all>
+Usage (openpi venv):  build_dataset.py <repo_id> <max_episodes|all>
 """
 import os
 import shutil
 import sys
 from pathlib import Path
 
-os.chdir(Path(__file__).resolve().parent)
+os.chdir(Path(__file__).resolve().parents[1])  # droid-sim-evals root (for the relative runs/ paths)
 repo = sys.argv[1]
 nmax = None if sys.argv[2] in ("all", "None", "") else int(sys.argv[2])
 

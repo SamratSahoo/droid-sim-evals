@@ -1,0 +1,4 @@
+# Default config for slurm/build_pure.slurm — build+push one pure toys LeRobot dataset.
+# Override:  sbatch slurm/build_pure.slurm cfg/my_build.yml
+repo_id: SamratSahoo/toys100_sim
+max_episodes: all      # integer count, or "all" for every collected episode

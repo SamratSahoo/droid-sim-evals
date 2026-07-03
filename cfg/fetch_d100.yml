@@ -1,0 +1,4 @@
+# Default config for slurm/fetch_d100.slurm — pre-cache a dataset into the LeRobot cache so
+# parallel merge jobs share it without a download race.
+# Override:  sbatch slurm/fetch_d100.slurm cfg/my_fetch.yml
+repo: SamratSahoo/d100

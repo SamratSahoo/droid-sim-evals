@@ -28,6 +28,8 @@ import torch
 import tyro
 from tqdm import tqdm
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # droid-sim-evals root on path for `src`
 from src.sim_evals.inference.tiptop_websocket import TiptopWebsocketClient
 from src.sim_evals.sim_utils import settle_sim
 from src.visual_utils import add_top_padding, overlay_timer_ms

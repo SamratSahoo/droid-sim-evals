@@ -52,10 +52,13 @@ except ImportError:  # optional: _Mp4Writer falls back to cv2 when mediapy is ab
 import numpy as np
 import tyro
 
+# This module lives in eval/; put the droid-sim-evals root on sys.path so `from src...` resolves
+# whether run as `python eval/full_eval.py` or spawned as a subprocess.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.visual_utils import add_label_bar, add_top_padding, overlay_timer_ms
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _SCRIPT_DIR.parent
+_SCRIPT_DIR = Path(__file__).resolve().parent   # droid-sim-evals/eval
+_REPO_ROOT = _SCRIPT_DIR.parents[1]             # tamp-vla
 DEFAULT_OPENPI_DIR = str(_REPO_ROOT / "openpi")
 DEFAULT_TIPTOP_DIR = str(_REPO_ROOT / "tiptop")
 # Perception model servers the tiptop planning server depends on (HTTP).

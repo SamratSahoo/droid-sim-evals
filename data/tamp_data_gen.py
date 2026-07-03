@@ -71,8 +71,13 @@ import tyro
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("tamp_data_gen")
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _SCRIPT_DIR.parent
+_SCRIPT_DIR = Path(__file__).resolve().parent   # droid-sim-evals/data
+_DSE_DIR = _SCRIPT_DIR.parent                    # droid-sim-evals
+_REPO_ROOT = _DSE_DIR.parent                     # tamp-vla
+# This module lives in data/ but imports `src` (at the droid-sim-evals root) and `full_eval`
+# (in eval/) lazily inside functions; put both on sys.path so those bare imports resolve no
+# matter where python is invoked from.
+sys.path[:0] = [str(_DSE_DIR), str(_DSE_DIR / "eval")]
 DEFAULT_OPENPI_DIR = str(_REPO_ROOT / "openpi")
 DEFAULT_TIPTOP_DIR = str(_REPO_ROOT / "tiptop")
 DEFAULT_M2T2_DIR = str(_REPO_ROOT / "M2T2")

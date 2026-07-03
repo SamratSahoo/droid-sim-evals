@@ -1,11 +1,15 @@
 """Save an initial observation from a DROID sim scene to an H5 file."""
 import argparse
 import logging
+import sys
+from pathlib import Path
+
 import h5py
 import torch
 import gymnasium as gym
 import tyro
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # droid-sim-evals root on path for `src`
 from src.sim_evals.sim_utils import settle_sim
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
