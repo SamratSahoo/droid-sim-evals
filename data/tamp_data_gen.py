@@ -93,16 +93,10 @@ _IMG_HW = (180, 320)  # DROID LeRobot image size (H, W)
 # Canonical "resting flat" toy orientation (wxyz) from assets/scene6_0.json: 90 deg about X.
 TOY_BASE_QUAT = np.array([0.70710678, 0.70710678, 0.0, 0.0], dtype=np.float64)
 
-# DROID joint schema -- must match openpi's LeRobotDROIDDataConfig features.
-_DROID_FEATURES = {
-    "exterior_image_1_left": {"dtype": "image", "shape": (180, 320, 3), "names": ["height", "width", "channel"]},
-    "exterior_image_2_left": {"dtype": "image", "shape": (180, 320, 3), "names": ["height", "width", "channel"]},
-    "wrist_image_left": {"dtype": "image", "shape": (180, 320, 3), "names": ["height", "width", "channel"]},
-    "joint_position": {"dtype": "float32", "shape": (7,), "names": ["joint_position"]},
-    "gripper_position": {"dtype": "float32", "shape": (1,), "names": ["gripper_position"]},
-    # Joint *velocity* (7) + gripper position (1); the action space pi05-DROID was pretrained on.
-    "actions": {"dtype": "float32", "shape": (8,), "names": ["actions"]},
-}
+# The output LeRobot v3.0 (video, DROID 1.0.1) schema is defined in lerobot_v3.py (V3DatasetWriter):
+# camera videos + observation.state.* + action.joint_velocity/action.gripper_position. The sim
+# generation below still records per-episode RGB mp4s + joint/gripper/action; build_lerobot_dataset
+# feeds those to the v3.0 writer.
 
 # sim observation camera key -> (LeRobot feature, per-episode mp4 filename)
 _CAMERAS = {
@@ -783,7 +777,12 @@ def build_lerobot_dataset(
     LeRobotDataset accumulates ~0.27 GB of anon RAM per episode and can't do 300 eps on a 30 GB host.
     Returns the number of episodes written.
     """
-    from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+    import sys
+
+    from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from lerobot_v3 import VIDEO_KEY_MAP, V3DatasetWriter
 
     out_path = Path(out_dir)
     ep_dirs = sorted(p for p in out_path.glob("ep_*") if (p / "tiptop_plan.json").is_file())
@@ -811,18 +810,11 @@ def build_lerobot_dataset(
         logger.info(f"Removing existing local dataset at {dataset_root}")
         shutil.rmtree(dataset_root)
 
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        robot_type="panda",
-        fps=FPS,
-        features=_DROID_FEATURES,
-        # SYNCHRONOUS image writing (no async worker pool). The async pool (processes=5) buffers frames
-        # across episodes and balloons RAM at scale -- it OOM-killed the 300-episode toys300 build on this
-        # 30G host (even with the data-gen worker stopped). Writing each frame inline bounds peak RAM to
-        # ~one decoded episode (~1 GB); slower but it cannot OOM. Matches merge_datasets' writer config.
-        image_writer_threads=4,
-        image_writer_processes=0,
-    )
+    # Write LeRobot v3.0 (video, DROID 1.0.1 schema) via our incremental writer: camera frames encode
+    # straight to per-camera MP4s and the low-dim parquet is written one row group per episode, so peak
+    # RAM stays ~one decoded episode (it cannot OOM the way lerobot's cross-episode add_frame buffer did
+    # on this 30G host).
+    writer = V3DatasetWriter(dataset_root, FPS)
 
     n_written = 0
     for ep in ep_dirs:
@@ -907,24 +899,23 @@ def build_lerobot_dataset(
                     logger.warning(f"{ep.name}: {feat} has {len(frames)} frames vs {n} state frames; resampling (possible image/state desync)")
         img_sel = {feat: _resample_indices(len(frames), n) for feat, frames in decoded.items()}
 
-        for i in range(n):
-            dataset.add_frame(
-                {
-                    "exterior_image_1_left": decoded["exterior_image_1_left"][img_sel["exterior_image_1_left"][i]],
-                    "exterior_image_2_left": decoded["exterior_image_2_left"][img_sel["exterior_image_2_left"][i]],
-                    "wrist_image_left": decoded["wrist_image_left"][img_sel["wrist_image_left"][i]],
-                    "joint_position": joint_pos[i],
-                    "gripper_position": g_state[i : i + 1],
-                    "actions": np.concatenate([vel[i], g_action[i : i + 1]]).astype(np.float32),
-                    "task": task,
-                }
-            )
-        dataset.save_episode()
+        # Align each camera's decoded frames to the n state frames, then write the episode. ``actions``
+        # is joint velocity[7] + gripper[1] (the pi05-DROID action space); the writer splits it into
+        # action.joint_velocity / action.gripper_position for the DROID v3.0 schema.
+        aligned = {feat: np.stack([decoded[feat][img_sel[feat][i]] for i in range(n)]) for feat in VIDEO_KEY_MAP}
+        ep_actions = np.concatenate([vel[:n], g_action[:n].reshape(n, 1)], axis=1).astype(np.float32)
+        writer.add_episode(
+            images=aligned,
+            joint_position=joint_pos[:n],
+            gripper_position=g_state[:n].reshape(n, 1),
+            actions=ep_actions,
+            task=task,
+        )
         n_written += 1
         logger.info(f"  [{n_written}/{len(ep_dirs)}] {ep.name}: {n} frames | task: {task!r}")
 
     logger.info(f"Wrote {n_written} episodes to {dataset_root}")
-    dataset.stop_image_writer()  # release the writer pool + finalize files before uploading
+    writer.finalize()  # flush encoders + parquet, write meta/info.json (v3.0) before uploading
     if push and n_written:
         _upload_dataset(dataset_root, repo_id, private, ["droid", "panda", "sim", "tamp", "toys"])
     return n_written
@@ -933,67 +924,43 @@ def build_lerobot_dataset(
 # --------------------------------------------------------------------------- #
 # Merge: combine finished DROID-joint LeRobot datasets (openpi venv)            #
 # --------------------------------------------------------------------------- #
-_IMG_KEYS = ("exterior_image_1_left", "exterior_image_2_left", "wrist_image_left")
-
-
-def _to_hwc_uint8(img) -> np.ndarray:
-    """A LeRobot image frame (CHW float[0,1] tensor or HWC array) -> HWC uint8 for add_frame."""
-    arr = img.detach().cpu().numpy() if hasattr(img, "detach") else np.asarray(img)
-    if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[2] not in (1, 3):
-        arr = np.transpose(arr, (1, 2, 0))  # CHW -> HWC
-    if arr.dtype != np.uint8:
-        arr = np.clip(np.rint(arr.astype(np.float32) * 255.0), 0, 255).astype(np.uint8)
-    return arr
-
-
 def merge_datasets(*, sources: List[str], repo_id: str, push: bool, private: bool) -> int:
-    """Merge >=2 finished DROID-joint LeRobot datasets (local cache or Hub) into one.
+    """Merge >=2 finished LeRobot datasets from the Hub into one v3.0 (video, DROID schema) dataset.
 
-    Mirrors openpi/examples/droid/merge_lerobot_datasets.py: episodes are copied verbatim
-    (per-episode 15 Hz timeline rebuilt by add_frame), instructions carried over. Returns the
-    number of episodes written.
+    Each source is STREAMED episode-by-episode (v2.1 inline-image OR v3.0 video sources are both
+    handled by ``iter_episodes``) and re-emitted verbatim through the incremental v3.0 writer, so the
+    merge needs no local source download and is memory-bounded (it cannot OOM the way the old
+    per-frame add_frame merge did at ~400 episodes). Returns the number of episodes written.
     """
-    from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+    import sys
+
+    from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from lerobot_v3 import V3DatasetWriter, iter_episodes
 
     dataset_root = HF_LEROBOT_HOME / repo_id
     if dataset_root.exists():
         logger.info(f"Removing existing local dataset at {dataset_root}")
         shutil.rmtree(dataset_root)
 
-    # Synchronous, single-process image writing (no async worker pool): merging also loads a large
-    # source dataset into this process, so we keep the writer's RAM footprint minimal to leave
-    # headroom (the multi-process writer otherwise buffers images across 5 procs).
-    out = LeRobotDataset.create(
-        repo_id=repo_id, robot_type="panda", fps=FPS, features=_DROID_FEATURES,
-        image_writer_threads=2, image_writer_processes=0,
-    )
     total = 0
+    writer = V3DatasetWriter(dataset_root, FPS)
     for src_id in sources:
-        src = LeRobotDataset(src_id)  # local cache if present, else pulled from the Hub
-        missing = [k for k in _DROID_FEATURES if k not in src.features]
-        if missing:
-            raise ValueError(f"Source '{src_id}' missing {missing}; not a DROID-joint LeRobot dataset.")
-        logger.info(f"Merging {src.num_episodes} episodes from {src_id}")
-        for ep in range(src.num_episodes):
-            start = int(src.episode_data_index["from"][ep])
-            end = int(src.episode_data_index["to"][ep])
-            task = "do something"
-            for i in range(start, end):
-                f = src[i]
-                task = f["task"]
-                frame = {
-                    "joint_position": np.asarray(f["joint_position"], dtype=np.float32).reshape(7),
-                    "gripper_position": np.asarray(f["gripper_position"], dtype=np.float32).reshape(1),
-                    "actions": np.asarray(f["actions"], dtype=np.float32).reshape(8),
-                    "task": task,
-                }
-                for k in _IMG_KEYS:
-                    frame[k] = _to_hwc_uint8(f[k])
-                out.add_frame(frame)
-            out.save_episode()
+        n_src = 0
+        for ep in iter_episodes(src_id):
+            writer.add_episode(
+                images=ep["images"],
+                joint_position=ep["joint_position"],
+                gripper_position=ep["gripper_position"],
+                actions=ep["actions"],
+                task=ep["task"],
+            )
             total += 1
+            n_src += 1
+        logger.info(f"Merged {n_src} episodes from {src_id}")
+    writer.finalize()
     logger.info(f"Wrote {total} merged episodes from {len(sources)} sources to {dataset_root}")
-    out.stop_image_writer()  # release the writer pool + finalize files before uploading
     if push and total:
         _upload_dataset(dataset_root, repo_id, private, ["droid", "panda", "tamp-vla", "merged"])
     return total

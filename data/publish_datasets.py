@@ -49,7 +49,7 @@ assert idx == 300, f"expected 300 episodes, found {idx}"
 
 from tamp_data_gen import build_lerobot_dataset, INSTRUCTION  # noqa: E402
 from huggingface_hub import HfApi  # noqa: E402
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset  # noqa: E402
+from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME  # noqa: E402
 
 api = HfApi()
 
@@ -65,12 +65,8 @@ for repo, n in [("SamratSahoo/toys20_sim", 20), ("SamratSahoo/toys100_sim", 100)
     shutil.rmtree(HF_LEROBOT_HOME / repo, ignore_errors=True)  # free disk
     free(f"after {repo}")
 
-# --- 3) fetch d100 once (merge needs it local) ---
-print(f"\n===== fetching {D100} (for merges) =====", flush=True)
-LeRobotDataset(D100)
-free("after d100 fetch")
-
-# --- 4) merge d100 + each toys set (streams toys from the Hub); each push self-deletes its build ---
+# --- 3) merge d100 + each toys set. Both sources STREAM from the Hub (v3.0 toys + v2.1/v3.0 d100),
+#        so nothing is fetched locally; each push self-deletes its build. ---
 for pure, out in [("SamratSahoo/toys20_sim", "SamratSahoo/d100_toys20_sim"),
                   ("SamratSahoo/toys100_sim", "SamratSahoo/d100_toys100_sim"),
                   ("SamratSahoo/toys300_sim", "SamratSahoo/d100_toys300_sim")]:
@@ -82,8 +78,7 @@ for pure, out in [("SamratSahoo/toys20_sim", "SamratSahoo/d100_toys20_sim"),
     prune_hub_cache("toys")  # drop streamed toys blobs
     free(f"after {out}")
 
-# --- 5) cleanup d100 + hub caches ---
-shutil.rmtree(HF_LEROBOT_HOME / D100, ignore_errors=True)
+# --- 5) cleanup hub caches ---
 prune_hub_cache("d100")
 shutil.rmtree(ALL, ignore_errors=True)
 print("\n===== ALL DONE: 6 datasets published (toys{20,100,300}_sim + d100_toys{20,100,300}_sim) =====", flush=True)
