@@ -3,12 +3,15 @@ name = "sim-evals"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+# Neuronic is RHEL 9.7 / glibc 2.34. isaaclab 2.2.0 pulls isaacsim 5.0 (manylinux_2_35, needs
+# glibc >=2.35) which won't run here, so we pin isaaclab 2.1.0 -> isaacsim 4.5 (manylinux_2_34,
+# native-OK). That 4.5 stack is Python 3.10 (cp310 wheels), hence requires-python 3.10.
+requires-python = ">=3.10,<3.11"
 dependencies = [
   "pip>=25.0",
   "mediapy>=1.2.4",
   "openpi-client",
-  "isaaclab[all,isaacsim]==2.2.0",
+  "isaaclab[all,isaacsim]==2.1.0",
   "tyro>=0.9.17",
   "google>=3.0.0",
   "google-genai<1.60",
@@ -23,6 +26,9 @@ dependencies = [
 override-dependencies = [
   "websockets>=16.0",
 ]
+# isaaclab/isaacsim only publish linux (+win) wheels; constrain the universal resolver to this
+# Neuronic env (linux, py3.10) so it doesn't fail trying to satisfy macOS / other Python splits.
+environments = ["sys_platform == 'linux' and python_full_version >= '3.10' and python_full_version < '3.11'"]
 
 [tool.uv.extra-build-dependencies]
 flatdict = ["setuptools<71"]
