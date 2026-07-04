@@ -177,7 +177,7 @@ def _fmt_summary(summary: dict, scenes: list) -> str:
 
 
 def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=False,
-         max_steps=1800, seed=0) -> None:
+         max_steps=1800, seed=0, fallback_rollouts=None) -> None:
     _OUT_ROOT.mkdir(parents=True, exist_ok=True)
     scenes = sorted(scenes_filter) if scenes_filter else sorted(SCENE_TASKS)
     policies = POLICIES if not policies_filter else [p for p in POLICIES if p[0] in policies_filter]
@@ -224,6 +224,11 @@ def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=
             for s in todo:
                 out_dir = _OUT_ROOT / name / SCENE_TASKS[s]
                 res = _run_worker(s, control_mode, out_dir, num_rollouts, record_video, max_steps, seed)
+                if not res and fallback_rollouts and fallback_rollouts < num_rollouts:
+                    # A crashed worker (e.g. VRAM OOM on scene load) leaves no results.json; retry smaller.
+                    log.warning(f"  [{name}/{SCENE_TASKS[s]}] {num_rollouts}-env run failed; "
+                                f"retrying at {fallback_rollouts} rollouts")
+                    res = _run_worker(s, control_mode, out_dir, fallback_rollouts, record_video, max_steps, seed)
                 if res:
                     summary[name][str(s)] = {"dense": res["dense_score"], "sparse": res["sparse_score"]}
                     log.info(f"  [{name}/{SCENE_TASKS[s]}] dense={res['dense_score']:.3f} "
@@ -254,6 +259,8 @@ def _parse_args():
     ap.add_argument("--scenes", nargs="*", type=int, default=None, metavar="ID",
                     help=f"subset of scene ids (default: all: {sorted(SCENE_TASKS)})")
     ap.add_argument("--num-rollouts", type=int, default=8, help="parallel randomized envs per scene (default 8)")
+    ap.add_argument("--rollout-fallback", type=int, default=None,
+                    help="if a scene's worker crashes (e.g. VRAM OOM), retry it at this many rollouts")
     ap.add_argument("--record-video", action="store_true", help="write a tiled multi-env video.mp4 per scene (default off)")
     ap.add_argument("--max-steps", type=int, default=1800, help="env steps per rollout")
     ap.add_argument("--seed", type=int, default=0)
@@ -273,4 +280,5 @@ def _parse_args():
 if __name__ == "__main__":
     a = _parse_args()
     sys.exit(main(policies_filter=a.policies, scenes_filter=a.scenes, num_rollouts=a.num_rollouts,
-                  record_video=a.record_video, max_steps=a.max_steps, seed=a.seed))
+                  record_video=a.record_video, max_steps=a.max_steps, seed=a.seed,
+                  fallback_rollouts=a.rollout_fallback))
