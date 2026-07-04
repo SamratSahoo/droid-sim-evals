@@ -1,0 +1,17 @@
+{
+  "_comment": "Scene 10 (push the button). The articulated e-stop (estop_button.usda): a PhysicsArticulationRoot with a world-fixed base + a prismatic 'press_joint' (cap slides down along the button axis). kind:articulation spawns it as an ArticulationCfg so the joint stays live. USDA is metersPerUnit=0.01, upAxis=Y, ~300 units tall -> scale 3.71e-4 (=>~0.12m) + rot 90deg about X (Y-up->Z-up, so the press axis points down into the table). fix_base anchors it. press_joint: authored travel ~8 stage-units => ~3mm after scale; the actuator gives it a spring return the robot must overcome. Verify z (base resting on table) + press stroke in the smoke render.",
+  "objects": [
+    {
+      "name": "button",
+      "kind": "articulation",
+      "usd": "custom/button/estop_articulated/estop_button.usda",
+      "scale": 0.000371,
+      "pos": [0.48, 0.05, 0.05],
+      "rot": [0.70710678, 0.70710678, 0.0, 0.0],
+      "solver_iters": 32,
+      "actuators": {
+        "press": {"joints": ["press_joint"], "stiffness": 500.0, "damping": 10.0}
+      }
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "_comment": "Scene 12 (place the blocks on the plate, no collisions). Same task/criteria as scene 6 but with three 5cm rigid cuboids instead of the deformable toys. Plate = the scene6 preprocessed metric OBJ (rigid, convexDecomposition collider so the concave rim survives). Base scene12_0.usd = empty table+dome+robot. Table-top surface ~z=0.045; plate at z=0.05, blocks centered at z=0.075. Randomized per env: plate XY, blocks XY+yaw starting clear of the plate (see eval/scene_specs.py).",
+  "objects": [
+    {
+      "name": "plate",
+      "kind": "rigid",
+      "mesh": "custom/plate_toys/processed/plate.obj",
+      "pos": [0.45, 0.1, 0.05],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.85, 0.85, 0.88],
+      "mass": 0.4,
+      "collision": "convexDecomposition",
+      "rigid": {"static_friction": 1.0, "dynamic_friction": 1.0},
+      "kinematic": false
+    },
+    {
+      "name": "block_a",
+      "kind": "box",
+      "size": [0.05, 0.05, 0.05],
+      "pos": [0.32, 0.2, 0.075],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.85, 0.1, 0.1],
+      "mass": 0.05,
+      "rigid": {"static_friction": 0.7, "dynamic_friction": 0.6}
+    },
+    {
+      "name": "block_b",
+      "kind": "box",
+      "size": [0.05, 0.05, 0.05],
+      "pos": [0.34, -0.08, 0.075],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.1, 0.7, 0.2],
+      "mass": 0.05,
+      "rigid": {"static_friction": 0.7, "dynamic_friction": 0.6}
+    },
+    {
+      "name": "block_c",
+      "kind": "box",
+      "size": [0.05, 0.05, 0.05],
+      "pos": [0.59, 0.22, 0.075],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.15, 0.35, 0.9],
+      "mass": 0.05,
+      "rigid": {"static_friction": 0.7, "dynamic_friction": 0.6}
+    }
+  ]
+}

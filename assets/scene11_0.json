@@ -1,0 +1,18 @@
+{
+  "_comment": "Scene 11 (open the white cabinet). The MuJoCo 3-drawer cabinet, converted MJCF->USD by data/preprocess_assets.py (custom/cabinet/processed/white_cabinet.usd): a fix_base articulation with three prismatic slide joints top/middle/bottom_level (drawers pull out ~0.16m along the cabinet's local -Y). Already metric (~0.26x0.22x0.32m) so scale=1.0. rot = -90deg yaw about Z so a drawer opening faces the robot (-X). Actuators leave the drawers free (stiffness 0) with light damping so a pulled drawer stays open. Verify orientation (drawer reachable), z (base on table), and drawer visibility in the smoke render.",
+  "objects": [
+    {
+      "name": "cabinet",
+      "kind": "articulation",
+      "usd": "custom/cabinet/processed/white_cabinet.usd",
+      "scale": 1.0,
+      "pos": [0.52, 0.05, 0.045],
+      "rot": [0.70710678, 0.0, 0.0, -0.70710678],
+      "fix_base": true,
+      "solver_iters": 32,
+      "actuators": {
+        "drawers": {"joints": [".*_level"], "stiffness": 0.0, "damping": 30.0}
+      }
+    }
+  ]
+}

@@ -1,0 +1,98 @@
+{
+  "cabinet": {
+    "usd": "custom/cabinet/processed/white_cabinet.usd",
+    "articulation_roots": [
+      "/white_cabinet_isaac/base/base"
+    ],
+    "joints": [
+      "top_level",
+      "middle_level",
+      "bottom_level"
+    ],
+    "bbox_m": [
+      0.2564,
+      0.2218,
+      0.217
+    ]
+  },
+  "estop_button_articulated": {
+    "path": "custom/button/estop_articulated/estop_button.usda",
+    "raw_units": [
+      323.513,
+      300.0,
+      323.513
+    ],
+    "target_longest_m": 0.12,
+    "scale": 0.000371,
+    "scaled_m": [
+      0.12,
+      0.1113,
+      0.12
+    ],
+    "thin_axis": "Y"
+  },
+  "Emergency_Stop_Button": {
+    "path": "custom/button/Emergency_Stop_Button.usdz",
+    "raw_units": [
+      323.513,
+      300.0,
+      323.513
+    ],
+    "target_longest_m": 0.12,
+    "scale": 0.000371,
+    "scaled_m": [
+      0.12,
+      0.1113,
+      0.12
+    ],
+    "thin_axis": "Y"
+  },
+  "Button_Key_factory": {
+    "path": "custom/button/Button_Key__factory_8MB.usdz",
+    "raw_units": [
+      188.701,
+      200.0,
+      200.0
+    ],
+    "target_longest_m": 0.1,
+    "scale": 0.0005,
+    "scaled_m": [
+      0.0944,
+      0.1,
+      0.1
+    ],
+    "thin_axis": "X"
+  },
+  "Whiteboard": {
+    "path": "custom/whiteboard/Whiteboard.usdz",
+    "raw_units": [
+      467.504,
+      300.0,
+      22.549
+    ],
+    "target_longest_m": 0.3,
+    "scale": 0.000642,
+    "scaled_m": [
+      0.3001,
+      0.1926,
+      0.0145
+    ],
+    "thin_axis": "Z"
+  },
+  "Whiteboard_Eraser": {
+    "path": "custom/whiteboard/Whiteboard_Eraser.usdz",
+    "raw_units": [
+      396.117,
+      300.0,
+      402.705
+    ],
+    "target_longest_m": 0.11,
+    "scale": 0.000273,
+    "scaled_m": [
+      0.1081,
+      0.0819,
+      0.1099
+    ],
+    "thin_axis": "Y"
+  }
+}

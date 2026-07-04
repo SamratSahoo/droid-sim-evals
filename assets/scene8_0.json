@@ -1,0 +1,27 @@
+{
+  "_comment": "Scene 8 (wipe the whiteboard). Base scene8_0.usd = empty table+dome+robot (copy of scene7_0.usd). Whiteboard + eraser are scanned Sketchfab USDZ (metersPerUnit ignored by Isaac -> scale ~6.4e-4/2.0e-4; upAxis=Y). Whiteboard lies FLAT (thin raw-Z axis -> world Z, so rot=identity); eraser stands thin-axis-up (rot 90deg about X). Scales/extents from assets/custom/processed_assets.json. Table-top collider surface ~z=0.045; objects placed a bit above to settle. NOTE: verify board flatness + eraser graspability in the smoke render; the eraser scan is near-cubic, fall back to kind:box if its convex-hull collider is unusable.",
+  "objects": [
+    {
+      "name": "whiteboard",
+      "kind": "usd_rigid",
+      "usd": "custom/whiteboard/Whiteboard.usdz",
+      "scale": 0.000642,
+      "pos": [0.47, 0.10, 0.06],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "mass": 2.0,
+      "collision": "convexHull",
+      "rigid": {"static_friction": 1.0, "dynamic_friction": 0.9}
+    },
+    {
+      "name": "eraser",
+      "kind": "usd_rigid",
+      "usd": "custom/whiteboard/Whiteboard_Eraser.usdz",
+      "scale": 0.0002,
+      "pos": [0.34, -0.03, 0.10],
+      "rot": [0.70710678, 0.70710678, 0.0, 0.0],
+      "mass": 0.05,
+      "collision": "convexHull",
+      "rigid": {"static_friction": 0.9, "dynamic_friction": 0.8}
+    }
+  ]
+}

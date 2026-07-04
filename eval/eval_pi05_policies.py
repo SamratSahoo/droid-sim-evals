@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
-"""Driver: evaluate 5 Pi-0.5 policies on the toys + cubes sim tasks (pi05-eval-v2).
+"""Driver: evaluate Pi-0.5 policies across the sim manipulation tasks (scenes 6-12).
 
-For each policy this script, one at a time to respect limited disk:
-  1. purges any stale HF cache for the model (user recently re-pushed),
-  2. downloads ONLY the inference-relevant files (``params/``, ``assets/``,
+For each policy, one at a time (limited disk + shared GPU), this script:
+  1. purges any stale HF cache + downloads ONLY the inference files (``params/``, ``assets/``,
      ``_CHECKPOINT_METADATA`` -- skips the ~6 GB ``train_state/`` optimizer state),
-  3. runs ``full_eval.py`` (pi05 only) on BOTH tasks in one server lifetime with
-     ``PI05_DEBUG_DUMP=1`` so the client records proprioception + every action,
-  4. reorganizes the outputs into
-        runs/pi05-eval-v2/<checkpoint_name>/<task>/{video.mp4, data.npy}
-     where <task> is ``toys`` (scene 6) or ``cubes`` (scene 7), and data.npy is a
-     pickled dict of per-step proprioception + actions (no images),
-  5. deletes the downloaded checkpoint and HF cache to free disk.
+  2. launches the openpi pi-0.5 policy server for that checkpoint (via full_eval's server helpers)
+     and waits for it,
+  3. runs the parallel-env eval worker (``eval/eval_worker.py``) once per selected scene: each
+     worker spins up ``--num-rollouts`` (default 8) parallel Isaac envs with randomized object
+     layouts, drives Pi-0.5, and scores every env against that scene's success criteria
+     (``eval/scene_specs.py``), writing ``results.json`` (+ optional tiled ``video.mp4``),
+  4. kills the server, deletes the checkpoint + HF cache to free disk.
 
-The base Pi-0.5 DROID policy is served straight from gs:// (openpi caches it; not
-purged, not in this host's limited disk budget).
+Two metrics per (policy, scene) are aggregated into ``runs/pi05-eval-v2/summary.{json,txt}``:
+  * DENSE  -- mean over envs of the fraction of that scene's success criteria met (partial credit),
+  * SPARSE -- fraction of envs meeting ALL criteria.
 
-Scene 6 is the plate + toys scene; scene 7 is the "push the yellow cube next to the red
-cube" task -- two separated cubes built the same way scene 6 is (an empty base USD plus a
-``assets/scene7_0.json`` sidecar; see droid_environment.py::_add_sidecar_objects).
+Scenes: 6 toys->plate, 7 push cubes, 8 wipe whiteboard, 9 stack blocks, 10 push button,
+11 open cabinet, 12 blocks->plate. The base Pi-0.5 DROID policy is served straight from gs://.
 
 Run with the eval venv python (cu128 torch), from the droid-sim-evals dir:
-    PI05_DEBUG_DUMP=1 .venv/bin/python eval_pi05_policies.py
-Optionally restrict to a subset of policies and/or scenes (e.g. re-run only the cubes task
-for three policies after changing scene 7, leaving the toys outputs untouched):
-    PI05_DEBUG_DUMP=1 .venv/bin/python eval_pi05_policies.py \
-        --policies pi05_droid_jointpos_polaris pi05_droid_base pi05droid_toys100_sim --scenes 7
+    .venv/bin/python eval/eval_pi05_policies.py                       # all policies, all scenes, 8 rollouts
+    .venv/bin/python eval/eval_pi05_policies.py --policies pi05_droid_base --scenes 8 10 11 --record-video
+    .venv/bin/python eval/eval_pi05_policies.py --num-rollouts 4 --scenes 6 7
 """
 
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -37,48 +35,39 @@ import sys
 import time
 from pathlib import Path
 
-# Disable HF's "xet" transfer layer. It keeps a content-addressed chunk cache
-# (~/.cache/huggingface/xet) IN ADDITION to the local_dir copy -- ~9 GB of duplicate,
-# persistent disk per model, which is exactly what this storage-limited host can't
-# afford. Plain HTTP downloads only the local_dir copy (which we delete each round).
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # avoid the ~9 GB duplicate xet chunk cache
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
-import numpy as np
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s",
-                    datefmt="%H:%M:%S")
-log = logging.getLogger("pi05_eval_v2")
-# Quiet the per-file HTTP request spam that otherwise floods the driver log.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("pi05_eval")
 for _noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3", "filelock"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-_SCRIPT_DIR = Path(__file__).resolve().parent          # droid-sim-evals/eval
-_DSE_DIR = _SCRIPT_DIR.parent                          # droid-sim-evals/
-_REPO_ROOT = _DSE_DIR.parent                           # tamp-vla/
+_EVAL_DIR = Path(__file__).resolve().parent          # droid-sim-evals/eval
+_DSE_DIR = _EVAL_DIR.parent                          # droid-sim-evals/
+_REPO_ROOT = _DSE_DIR.parent                         # tamp-vla/
 _VENV_PY = _DSE_DIR / ".venv" / "bin" / "python"
-_CKPT_ROOT = _REPO_ROOT / "openpi" / "checkpoints"     # local download target
+_CKPT_ROOT = _REPO_ROOT / "openpi" / "checkpoints"
 _HF_HUB = Path.home() / ".cache" / "huggingface" / "hub"
 _OUT_ROOT = _DSE_DIR / "runs" / "pi05-eval-v2"
+_WORKER = _EVAL_DIR / "eval_worker.py"
 
-# scene id -> output task folder name + instruction (matches full_eval DEFAULT_INSTRUCTIONS)
-TASKS = {
-    6: ("toys", "Place the toys on the plate with no collisions"),
-    7: ("cubes", "Push the yellow cube next to the red cube"),
-}
+sys.path[:0] = [str(_DSE_DIR), str(_EVAL_DIR)]
+from full_eval import _server_spec, start_server, wait_for_server, stop_server  # server lifecycle helpers
+from scene_specs import get_scene
+
+# scene id -> short output folder name (instructions come from scene_specs, the single source of truth).
+SCENE_TASKS = {6: "toys", 7: "cubes", 8: "whiteboard", 9: "stack", 10: "button", 11: "cabinet", 12: "blocks_plate"}
 
 # (output_name, hf_repo_or_None, serve_config, gs_checkpoint_or_None, control_mode)
-#   hf_repo None => served straight from the gs:// path in field 4 (no download / no cache purge).
-#   control_mode => "velocity" (7 arm outputs are joint velocities the env integrates) or
-#                   "position" (7 arm outputs are ABSOLUTE joint targets, e.g. the jointpos
-#                   polaris checkpoint). Wired to full_eval's --pi05-control-mode.
+#   hf_repo None => served straight from the gs:// path (no download / no cache purge).
+#   control_mode "velocity" (7 arm outputs are joint velocities the env integrates) or
+#                "position" (absolute joint targets, e.g. the jointpos polaris checkpoint).
 POLICIES = [
     ("pi05droid_d100_toys100_sim", "SamratSahoo/pi05droid_d100_toys100_sim", "pi05droid-full-d100+toys100sim", None, "velocity"),
     ("pi05droid_d100_toys20_sim",  "SamratSahoo/pi05droid_d100_toys20_sim",  "pi05droid-full-d100+toys20sim",  None, "velocity"),
     ("pi05droid_toys100_sim",      "SamratSahoo/pi05droid_toys100_sim",      "pi05droid-toys100sim",           None, "velocity"),
     ("pi05droid_toys20_sim",       "SamratSahoo/pi05droid_toys20_sim",       "pi05droid-toys20sim",            None, "velocity"),
-    # Full finetunes of pi05_BASE (own norm stats bundled at assets/SamratSahoo/<repo>/norm_stats.json
-    # -- NOT the DROID norm stats the pi05droid_* configs reuse).
     ("pi05base_d100",              "SamratSahoo/pi05base_d100",              "pi05base-full-d100",             None, "velocity"),
     ("pi05base_d100_toys100_sim",  "SamratSahoo/pi05base_d100_toys100_sim",  "pi05base-full-d100+toys100sim",  None, "velocity"),
     ("pi05base_d100_toys20_sim",   "SamratSahoo/pi05base_d100_toys20_sim",   "pi05base-full-d100+toys20sim",   None, "velocity"),
@@ -88,10 +77,8 @@ POLICIES = [
      "gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris", "position"),
 ]
 
-# Only these are needed to *serve* a checkpoint; train_state/ is optimizer state (~6 GB).
 DOWNLOAD_PATTERNS = ["params/**", "assets/**", "_CHECKPOINT_METADATA"]
-# Big image arrays in the debug npz we don't want in the proprio+action npy.
-_NPY_DROP_KEYS = {"query_req_exterior_image", "query_req_wrist_image"}
+_PI05_PORT = 8000
 
 
 def _free_disk_gb() -> float:
@@ -99,7 +86,6 @@ def _free_disk_gb() -> float:
 
 
 def _purge_hf_cache(repo: str) -> None:
-    # repo "SamratSahoo/pi05droid_toys20_sim" -> models--SamratSahoo--pi05droid_toys20_sim
     cache_dir = _HF_HUB / ("models--" + repo.replace("/", "--"))
     if cache_dir.exists():
         log.info(f"purging stale HF cache: {cache_dir}")
@@ -108,118 +94,122 @@ def _purge_hf_cache(repo: str) -> None:
 
 def _download(repo: str, dest: Path) -> None:
     from huggingface_hub import snapshot_download
-    # Resume-friendly: a previous run may have already pulled this checkpoint. A present
-    # params/_METADATA + a clean (no *.incomplete) .cache means the snapshot finished.
+
     meta = dest / "params" / "_METADATA"
     incomplete = list((dest / ".cache").rglob("*.incomplete")) if (dest / ".cache").exists() else []
     if meta.exists() and not incomplete:
-        size_gb = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file()) / 1e9
-        log.info(f"checkpoint already present ({size_gb:.1f} GB) at {dest}; skipping download")
+        log.info(f"checkpoint already present at {dest}; skipping download")
         return
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True, exist_ok=True)
     log.info(f"downloading {repo} (params+assets only) -> {dest}")
     t0 = time.time()
-    snapshot_download(
-        repo_id=repo,
-        local_dir=str(dest),
-        allow_patterns=DOWNLOAD_PATTERNS,
-    )
+    snapshot_download(repo_id=repo, local_dir=str(dest), allow_patterns=DOWNLOAD_PATTERNS)
     size_gb = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file()) / 1e9
     log.info(f"downloaded {size_gb:.1f} GB in {time.time() - t0:.0f}s")
 
 
-def _run_full_eval(config: str, checkpoint: str, staging: Path, control_mode: str, scenes) -> int:
-    """Run full_eval.py for pi05 only on the given task scenes; returns exit code."""
-    staging.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        str(_VENV_PY), str(_SCRIPT_DIR / "full_eval.py"),
-        "--policies", "pi05",
-        "--mode", "alternating",
-        "--no-launch-perception",
-        "--scenes", *[str(s) for s in scenes],
-        "--out-dir", str(staging),
-        "--pi05-config", config,
-        "--pi05-checkpoint", checkpoint,
-        "--pi05-control-mode", control_mode,
-    ]
-    env = dict(os.environ)
-    env["PI05_DEBUG_DUMP"] = "1"
-    env.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
-    log.info("running full_eval: " + " ".join(cmd))
-    return subprocess.run(cmd, cwd=str(_DSE_DIR), env=env).returncode
-
-
-def _npz_to_npy(npz_path: Path, npy_path: Path, instruction: str, control_mode: str) -> bool:
-    """Distill the pi05 debug npz into a proprioception + actions dict saved as .npy."""
-    if not npz_path.exists():
-        log.warning(f"no debug npz at {npz_path}; skipping npy")
-        return False
-    data = np.load(npz_path, allow_pickle=True)
-    out = {k: data[k] for k in data.files if k not in _NPY_DROP_KEYS}
-    out["instruction"] = instruction
-    out["control_mode"] = control_mode
-    # The 7 arm action dims are joint velocities (rad/s) in velocity mode, or absolute
-    # joint-position targets (rad) in position mode -- state which so the npy is unambiguous.
-    arm_desc = "7 joint vel rad/s" if control_mode == "velocity" else "7 joint pos rad (abs targets)"
-    # Field guide for the consumer of this npy.
-    out["_field_notes"] = (
-        f"control_mode={control_mode}. "
-        "Per-step (len=num_steps): joint_position[7]=arm proprio (rad), "
-        f"gripper_position[1]=gripper proprio, action[8]=action sent to env "
-        f"({arm_desc} + binarized gripper), chunk_action[8]=raw served row, "
-        "gripper_raw=pre-binarization gripper, queried=server hit that step. "
-        "Per-query (len=num_queries): query_action_chunk[H,8]=full predicted chunk."
+def _launch_server(config: str, checkpoint: str) -> "subprocess.Popen":
+    """Launch the openpi pi-0.5 server for a checkpoint and wait until it accepts connections."""
+    spec = _server_spec(
+        "pi05",
+        openpi_dir=str(_REPO_ROOT / "openpi"),
+        tiptop_dir=str(_REPO_ROOT / "tiptop"),          # unused for pi05
+        pi05_config=config,
+        pi05_checkpoint=checkpoint,
+        pi05_host="localhost",
+        pi05_port=_PI05_PORT,
+        tiptop_host="localhost",
+        tiptop_port=8765,
+        tiptop_server_module="tiptop.tiptop_websocket_server",
+        xla_mem_fraction=0.5,                           # share the GPU with the Isaac worker
     )
-    np.save(npy_path, out, allow_pickle=True)
-    log.info(f"wrote {npy_path} ({int(data['num_steps']) if 'num_steps' in data.files else '?'} steps)")
-    return True
+    proc = start_server("pi05", spec)
+    if not wait_for_server(proc, "localhost", _PI05_PORT, timeout=1800):
+        stop_server(proc)
+        raise RuntimeError("pi05 server failed to start")
+    return proc
 
 
-def _collect(name: str, staging: Path, control_mode: str, tasks: dict) -> None:
-    """Move per-scene mp4/npz from staging into <name>/<task>/{video.mp4,data.npy}."""
-    for scene, (task, instruction) in tasks.items():
-        dest = _OUT_ROOT / name / task
-        dest.mkdir(parents=True, exist_ok=True)
-        mp4 = staging / f"pi05_scene{scene}.mp4"
-        npz = staging / f"pi05_scene{scene}_debug.npz"
-        if mp4.exists():
-            shutil.move(str(mp4), str(dest / "video.mp4"))
-            log.info(f"video -> {dest / 'video.mp4'}")
-        else:
-            log.warning(f"[{name}/{task}] no video produced (scene {scene})")
-        _npz_to_npy(npz, dest / "data.npy", instruction, control_mode)
+def _run_worker(scene: int, control_mode: str, out_dir: Path, num_rollouts: int, record_video: bool,
+                max_steps: int, seed: int) -> dict:
+    """Run the parallel-env worker for one scene; return its parsed results.json ({} on failure)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(_VENV_PY), str(_WORKER),
+        "--scene", str(scene),
+        "--num-rollouts", str(num_rollouts),
+        "--out-dir", str(out_dir),
+        "--pi05-port", str(_PI05_PORT),
+        "--control-mode", control_mode,
+        "--max-steps", str(max_steps),
+        "--seed", str(seed),
+    ]
+    if record_video:
+        cmd.append("--record-video")
+    env = dict(os.environ)
+    env.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
+    log.info(f"  worker: scene {scene} ({SCENE_TASKS[scene]})")
+    rc = subprocess.run(cmd, cwd=str(_DSE_DIR), env=env).returncode
+    res_path = out_dir / "results.json"
+    if rc != 0 or not res_path.exists():
+        log.error(f"  worker scene {scene} failed (rc={rc}, results={res_path.exists()})")
+        return {}
+    return json.loads(res_path.read_text())
 
 
-def main(policies_filter=None, scenes_filter=None) -> None:
+def _fmt_summary(summary: dict, scenes: list) -> str:
+    """Render a policy x scene table of dense/sparse scores."""
+    cols = [SCENE_TASKS[s] for s in scenes]
+    w = max(14, max((len(c) for c in cols), default=0) + 2)
+    head = f"{'policy':32s} | " + " | ".join(f"{c:>{w}s}" for c in cols)
+    lines = [head, "-" * len(head)]
+    for name, per_scene in summary.items():
+        cells = []
+        for s in scenes:
+            r = per_scene.get(str(s)) or per_scene.get(s)
+            cells.append(f"{r['dense']:.2f}/{r['sparse']:.2f}" if r else "  --/-- ")
+        lines.append(f"{name:32s} | " + " | ".join(f"{c:>{w}s}" for c in cells))
+    lines.append("\n(cells are DENSE/SPARSE: dense=on-table-gated, sequence-credited mean of criteria; "
+                 "sparse=frac envs meeting ALL criteria)")
+    return "\n".join(lines)
+
+
+def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=False,
+         max_steps=1800, seed=0) -> None:
     _OUT_ROOT.mkdir(parents=True, exist_ok=True)
-
-    # Restrict to a subset of task scenes (default: all in TASKS) and/or policies (default:
-    # all in POLICIES) -- e.g. to re-run only scene 7 (cubes) for a few policies after
-    # changing that scene's geometry, without recomputing the (unchanged) scene 6 outputs.
-    tasks = TASKS if not scenes_filter else {s: TASKS[s] for s in scenes_filter}
+    scenes = sorted(scenes_filter) if scenes_filter else sorted(SCENE_TASKS)
     policies = POLICIES if not policies_filter else [p for p in POLICIES if p[0] in policies_filter]
 
-    log.info(f"output root: {_OUT_ROOT}")
-    log.info(f"free disk: {_free_disk_gb():.0f} GB")
-    log.info(f"scenes: {sorted(tasks)} ({', '.join(t for t, _ in tasks.values())})")
-    log.info(f"policies: {[p[0] for p in policies]}")
+    log.info(f"output root: {_OUT_ROOT} | free disk: {_free_disk_gb():.0f} GB")
+    log.info(f"scenes: {scenes} ({', '.join(SCENE_TASKS[s] for s in scenes)})")
+    log.info(f"policies: {[p[0] for p in policies]} | rollouts/scene: {num_rollouts}")
+
+    summary: dict = {}
+    summary_path = _OUT_ROOT / "summary.json"
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text())
 
     for name, repo, config, gs_checkpoint, control_mode in policies:
-        log.info("#" * 70)
+        log.info("#" * 72)
         log.info(f"### {name}  (config={config}, control_mode={control_mode})")
-        log.info("#" * 70)
-        # Resume: if every selected task's output already exists, this policy is done -- skip
-        # it (and make sure no stale checkpoint lingers on this storage-limited host).
-        done = all((_OUT_ROOT / name / task / "data.npy").exists() for task, _ in tasks.values())
-        if done:
-            log.info(f"[{name}] outputs already present for selected task(s); skipping")
+        # Resume: skip scenes whose results already exist; only run the missing ones.
+        todo = [s for s in scenes if not (_OUT_ROOT / name / SCENE_TASKS[s] / "results.json").exists()]
+        if not todo:
+            log.info(f"[{name}] all selected scenes already scored; loading + skipping")
+            summary.setdefault(name, {})
+            for s in scenes:
+                rp = _OUT_ROOT / name / SCENE_TASKS[s] / "results.json"
+                if rp.exists():
+                    r = json.loads(rp.read_text())
+                    summary[name][str(s)] = {"dense": r["dense_score"], "sparse": r["sparse_score"]}
             if repo is not None:
                 shutil.rmtree(_CKPT_ROOT / name, ignore_errors=True)
             continue
-        staging = _OUT_ROOT / name / "_staging"
+
         ckpt_dir = _CKPT_ROOT / name
+        server = None
         try:
             if repo is None:
                 checkpoint = gs_checkpoint
@@ -228,47 +218,59 @@ def main(policies_filter=None, scenes_filter=None) -> None:
                 _download(repo, ckpt_dir)
                 checkpoint = str(ckpt_dir)
                 log.info(f"free disk after download: {_free_disk_gb():.0f} GB")
+            server = _launch_server(config, checkpoint)
 
-            rc = _run_full_eval(config, checkpoint, staging, control_mode, sorted(tasks))
-            log.info(f"full_eval exit code: {rc}")
-            _collect(name, staging, control_mode, tasks)
+            summary.setdefault(name, {})
+            for s in todo:
+                out_dir = _OUT_ROOT / name / SCENE_TASKS[s]
+                res = _run_worker(s, control_mode, out_dir, num_rollouts, record_video, max_steps, seed)
+                if res:
+                    summary[name][str(s)] = {"dense": res["dense_score"], "sparse": res["sparse_score"]}
+                    log.info(f"  [{name}/{SCENE_TASKS[s]}] dense={res['dense_score']:.3f} "
+                             f"sparse={res['sparse_score']:.3f} rates={res['criterion_rates']}")
+                summary_path.write_text(json.dumps(summary, indent=2))  # checkpoint after each scene
         except Exception:  # noqa: BLE001 - keep going to the next policy
             log.exception(f"[{name}] failed; continuing to next policy")
         finally:
-            shutil.rmtree(staging, ignore_errors=True)
+            if server is not None:
+                stop_server(server)
             if repo is not None:
                 shutil.rmtree(ckpt_dir, ignore_errors=True)
                 _purge_hf_cache(repo)
-                # Defense-in-depth: xet should be off, but if anything repopulated the
-                # chunk cache, drop it so disk usage stays flat across the 4 downloads.
                 shutil.rmtree(_HF_HUB.parent / "xet", ignore_errors=True)
                 log.info(f"deleted checkpoint + cache; free disk: {_free_disk_gb():.0f} GB")
 
-    log.info("=" * 70)
-    log.info(f"DONE. Results under {_OUT_ROOT}")
+    summary_path.write_text(json.dumps(summary, indent=2))
+    table = _fmt_summary(summary, scenes)
+    (_OUT_ROOT / "summary.txt").write_text(table)
+    log.info("=" * 72)
+    log.info(f"DONE. Results under {_OUT_ROOT}\n\n{table}\n")
 
 
 def _parse_args():
-    ap = argparse.ArgumentParser(description="pi05-eval-v2 driver (toys + cubes sim tasks)")
+    ap = argparse.ArgumentParser(description="pi05 sim eval driver (scenes 6-12, parallel rollouts + success scoring)")
     ap.add_argument("--policies", nargs="*", default=None, metavar="NAME",
-                    help="subset of policy output names to run (default: all). "
-                         f"Choices: {', '.join(p[0] for p in POLICIES)}")
+                    help=f"subset of policy names (default: all). Choices: {', '.join(p[0] for p in POLICIES)}")
     ap.add_argument("--scenes", nargs="*", type=int, default=None, metavar="ID",
-                    help=f"subset of task scene ids to run (default: all: {sorted(TASKS)})")
+                    help=f"subset of scene ids (default: all: {sorted(SCENE_TASKS)})")
+    ap.add_argument("--num-rollouts", type=int, default=8, help="parallel randomized envs per scene (default 8)")
+    ap.add_argument("--record-video", action="store_true", help="write a tiled multi-env video.mp4 per scene (default off)")
+    ap.add_argument("--max-steps", type=int, default=1800, help="env steps per rollout")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
-    # Validate up front so a typo fails loudly instead of silently running nothing.
     if args.policies:
         known = {p[0] for p in POLICIES}
         bad = [n for n in args.policies if n not in known]
         if bad:
             ap.error(f"unknown --policies {bad}; choices: {sorted(known)}")
     if args.scenes:
-        bad = [s for s in args.scenes if s not in TASKS]
+        bad = [s for s in args.scenes if s not in SCENE_TASKS]
         if bad:
-            ap.error(f"unknown --scenes {bad}; choices: {sorted(TASKS)}")
+            ap.error(f"unknown --scenes {bad}; choices: {sorted(SCENE_TASKS)}")
     return args
 
 
 if __name__ == "__main__":
-    _args = _parse_args()
-    sys.exit(main(policies_filter=_args.policies, scenes_filter=_args.scenes))
+    a = _parse_args()
+    sys.exit(main(policies_filter=a.policies, scenes_filter=a.scenes, num_rollouts=a.num_rollouts,
+                  record_video=a.record_video, max_steps=a.max_steps, seed=a.seed))

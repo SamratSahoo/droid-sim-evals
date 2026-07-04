@@ -285,6 +285,52 @@ class SceneCfg(InteractiveSceneCfg):
                 ))
                 continue
 
+            if kind == "articulation":
+                # An articulated asset spawned as an ArticulationCfg so its joints stay live
+                # (used by the world-anchored e-stop button -- a prismatic press joint -- and the
+                # 3-drawer cabinet -- three slide joints). Unlike the usd_rigid path, this does NOT
+                # force a rigid body + convex hull onto every mesh (which would destroy the joints).
+                # ``scale`` uniformly rescales the referenced USD; ``fix_base`` anchors the root link
+                # to the world so the button/cabinet cannot be knocked off the table. ``actuators``
+                # maps a name -> {joints:[regex...], stiffness, damping, [effort_limit, velocity_limit]};
+                # stiffness 0 = a free (only-damped) joint like a drawer, stiffness>0 with the default
+                # zero target = a spring-return joint like the button cap.
+                s = float(obj.get("scale", 1.0))
+                act_spec = obj.get("actuators", {"joints": {"joints": [".*"], "stiffness": 0.0, "damping": 10.0}})
+                actuators = {
+                    act_name: ImplicitActuatorCfg(
+                        joint_names_expr=ap.get("joints", [".*"]),
+                        stiffness=ap.get("stiffness", 0.0),
+                        damping=ap.get("damping", 10.0),
+                        effort_limit=ap.get("effort_limit"),
+                        velocity_limit=ap.get("velocity_limit"),
+                    )
+                    for act_name, ap in act_spec.items()
+                }
+                spawn = sim_utils.UsdFileCfg(
+                    usd_path=str((DATA_PATH / obj["usd"]).resolve()),
+                    scale=(s, s, s),
+                    articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                        # Default None = keep the USD-authored base fixity. Both current assets
+                        # (estop_button.usda's base_fixed_joint, MjcfConverter fix_base cabinet) are
+                        # already world-anchored in their USD; forcing fix_root_link=True here would
+                        # try to add a second fixed joint and error (root has no RigidBodyAPI).
+                        fix_root_link=obj.get("fix_base"),
+                        enabled_self_collisions=obj.get("self_collision", False),
+                        solver_position_iteration_count=obj.get("solver_iters", 32),
+                        solver_velocity_iteration_count=0,
+                    ),
+                )
+                setattr(self, name, ArticulationCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/{name}",
+                    spawn=spawn,
+                    init_state=ArticulationCfg.InitialStateCfg(
+                        pos=pos, rot=rot, joint_pos=obj.get("joint_pos", {".*": 0.0}),
+                    ),
+                    actuators=actuators,
+                ))
+                continue
+
             if kind == "box":
                 # A simple colored rigid cuboid spawned via Isaac's native cuboid mesh path
                 # (no mesh asset needed) -- used by scene 7's two separated push cubes. Same
