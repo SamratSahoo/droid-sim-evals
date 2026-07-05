@@ -26,7 +26,6 @@ import argparse
 import json
 import logging
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -95,14 +94,6 @@ def measure_base(env, rigid_names, art_names, env_origins) -> dict:
     world0 = read_states(env, rigid_names, art_names)[0]
     o0 = env_origins[0].detach().cpu().numpy()
     return {k: {"pos": world0[k]["pos"] - o0, "quat": world0[k]["quat"]} for k in world0}
-
-
-# --------------------------------------------------------------------------- #
-# Per-env pi05 inference (one client per env, batched via a thread pool)        #
-# --------------------------------------------------------------------------- #
-def slice_obs(obs: dict, i: int) -> dict:
-    """Single-env view of the batched obs for env ``i`` (keeps the leading (1,...) dim pi05 expects)."""
-    return {"policy": {k: v[i : i + 1] for k, v in obs["policy"].items()}}
 
 
 # --------------------------------------------------------------------------- #
@@ -179,7 +170,7 @@ def main() -> int:
     import src.sim_evals.environments  # noqa: F401  (registers the "DROID" gym env)
     from isaaclab_tasks.utils import parse_env_cfg
 
-    from src.sim_evals.inference.pi05_websocket import Pi05WebsocketClient
+    from src.sim_evals.inference.pi05_batched import Pi05BatchedClient
     from src.sim_evals.environments.droid_environment import collapse_dome_lights, set_arm_control_mode
     from src.sim_evals.sim_utils import settle_sim
     from scene_specs import get_scene, sample_layout
@@ -194,6 +185,22 @@ def main() -> int:
     env_cfg = parse_env_cfg("DROID", device=device, num_envs=n, use_fabric=True)
     env_cfg.set_scene(str(args.scene), 0)
     env_cfg.episode_length_s = max(120.0, (args.max_steps + args.settle_steps + args.post_settle_steps) / FPS + 10.0)
+
+    # Speed opt 2: pi05 only consumes external_cam + wrist_cam, so shrink the unused 2nd exterior camera
+    # to ~nothing -> it no longer costs a full render each step (kept at 16x16, not removed, so its
+    # observation term still resolves; the tiny image is simply never read).
+    env_cfg.scene.external_cam_2.height = 16
+    env_cfg.scene.external_cam_2.width = 16
+
+    # Speed opt 1: render the cameras only every open_loop_horizon control steps instead of every step --
+    # the policy reads images once per query (every open_loop_horizon steps), so ~7/8 of the per-step
+    # renders are wasted. We keep Isaac's AUTO render on (fully disabling it hangs the RTX-sensor pipeline)
+    # but slow it to the query cadence, and phase-align it below so each query still gets a FRESH image
+    # (verified). Disabled when recording video (that needs a frame every step).
+    fast_render = not args.record_video
+    if fast_render:
+        env_cfg.sim.render_interval = env_cfg.decimation * args.open_loop_horizon
+
     if args.record_video:
         # Add high-res video-only clones of the third-person + wrist cameras (deep-copied from the
         # policy cams so they share pose/intrinsics, but at --render-height x --render-width and NOT in
@@ -238,13 +245,12 @@ def main() -> int:
         obs = settle_sim(env, obs, steps=args.settle_steps, reset_episode_buf=True)
         init = read_states(env, rigid, art)
 
-        # --- rollout: one pi05 client per env, concurrent per-step inference ---
-        clients = [] if args.dummy_policy else [
-            Pi05WebsocketClient(host=args.pi05_host, port=args.pi05_port,
-                                open_loop_horizon=args.open_loop_horizon) for _ in range(n)]
+        # --- rollout: ONE batched pi05 client drives all N envs per query step (single batch-N forward
+        # pass instead of N serial infers, which were ~67% of the eval's wall clock). ---
+        client = None if args.dummy_policy else Pi05BatchedClient(
+            host=args.pi05_host, port=args.pi05_port, num_envs=n, open_loop_horizon=args.open_loop_horizon)
         set_arm_control_mode("position" if args.dummy_policy else args.control_mode)
         traj = [[] for _ in range(n)]
-        failed = [False] * n
         writer = None
         if args.record_video:
             from full_eval import _Mp4Writer
@@ -259,40 +265,45 @@ def main() -> int:
 
         effective_mode = "position" if args.dummy_policy else args.control_mode
 
-        def hold(i):
-            # hold in place: zero arm velocity (velocity mode) or the current joint pos (position mode).
-            grip = obs["policy"]["gripper_pos"][i].detach().cpu().numpy()
-            arm = (np.zeros(7, np.float32) if effective_mode == "velocity"
-                   else obs["policy"]["arm_joint_pos"][i].detach().cpu().numpy())
-            return np.concatenate([arm, grip]).astype(np.float32)
+        def hold_all():
+            # (N,8) hold: zero arm velocity (velocity mode) or the current joint pos (position mode).
+            grip = obs["policy"]["gripper_pos"].detach().cpu().numpy().reshape(n, 1)
+            arm = (np.zeros((n, 7), np.float32) if effective_mode == "velocity"
+                   else obs["policy"]["arm_joint_pos"].detach().cpu().numpy())
+            return np.concatenate([arm, grip], axis=1).astype(np.float32)
 
-        def infer_one(i):
-            if args.dummy_policy or failed[i]:
-                return hold(i)
-            try:
-                return np.asarray(clients[i].infer(slice_obs(obs, i), spec.instruction)["action"], np.float32)
-            except Exception as e:  # noqa: BLE001 - inference error ends this env's episode
-                logger.warning(f"env {i}: infer failed ({e}); holding")
-                failed[i] = True
-                return infer_one(i)
+        if fast_render:
+            # Align the render phase: a render fires when _sim_step_counter hits a multiple of
+            # render_interval (= decimation * open_loop_horizon), so zeroing it here makes a render land on
+            # the env.step just before each query step -> query-step images stay fresh (verified).
+            env.unwrapped._sim_step_counter = 0
 
+        held = False   # once a batched query errors, hold the arm for the rest of the rollout
         from tqdm import tqdm
-        with ThreadPoolExecutor(max_workers=n) as ex:
-            for step in tqdm(range(max_steps), desc=f"scene{args.scene}"):
-                actions = np.stack(list(ex.map(infer_one, range(n))), axis=0)
-                if step % args.track_every == 0:
-                    for i, s in enumerate(read_states(env, rigid, art)):
-                        traj[i].append(s)
-                if writer is not None and step % args.video_every == 0:
-                    writer.add(fit_width(tile_grid(video_panels()), args.video_max_width))
-                obs, _, _, _, _ = env.step(torch.as_tensor(actions, dtype=torch.float32, device=env.unwrapped.device))
+        for step in tqdm(range(max_steps), desc=f"scene{args.scene}"):
+            if args.dummy_policy or held:
+                actions = hold_all()
+            else:
+                try:
+                    actions = client.infer(obs, spec.instruction)   # (N, 8)
+                except Exception as e:  # noqa: BLE001 - a server error ends the rollout
+                    logger.warning(f"batched infer failed ({e}); holding for the rest of the rollout")
+                    held, actions = True, hold_all()
+                if step == 0 and fast_render and client.chunk_len and client.chunk_len < args.open_loop_horizon:
+                    logger.warning(f"pi05 chunk length {client.chunk_len} < open_loop_horizon "
+                                   f"{args.open_loop_horizon}: policy re-queries faster than the render cadence "
+                                   f"-> some query images will be stale. Re-run with --open-loop-horizon "
+                                   f"{client.chunk_len}.")
+            if step % args.track_every == 0:
+                for i, s in enumerate(read_states(env, rigid, art)):
+                    traj[i].append(s)
+            if writer is not None and step % args.video_every == 0:
+                writer.add(fit_width(tile_grid(video_panels()), args.video_max_width))
+            obs, _, _, _, _ = env.step(torch.as_tensor(actions, dtype=torch.float32, device=env.unwrapped.device))
         if writer is not None:
             writer.close()
-        for c in clients:
-            try:
-                c.close()
-            except Exception:  # noqa: BLE001
-                pass
+        if client is not None:
+            client.close()
 
         # settle_sim holds by commanding measured joint POSITIONS, so it must run in position mode;
         # in velocity mode those positions would be read as velocities and flail the arm, corrupting

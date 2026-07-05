@@ -362,7 +362,7 @@ SCENES: Dict[int, SceneSpec] = {
     ),
     7: SceneSpec(
         scene_id=7,
-        instruction="Push the yellow block towards the red block until they are touching",
+        instruction="Push the yellow block into the red block.",
         rigid=["red_cube", "yellow_cube"],
         articulated=[],
         randomize=[
@@ -376,7 +376,7 @@ SCENES: Dict[int, SceneSpec] = {
     ),
     8: SceneSpec(
         scene_id=8,
-        instruction="Wipe the whiteboard with the black whiteboard eraser",
+        instruction="Use the eraser to wipe the whiteboard.",
         rigid=["whiteboard", "eraser"],
         articulated=[],
         randomize=[
@@ -390,7 +390,7 @@ SCENES: Dict[int, SceneSpec] = {
     ),
     9: SceneSpec(
         scene_id=9,
-        instruction="Stack the blocks on top of each other",
+        instruction="Stack the blocks together",
         rigid=["block_a", "block_b", "block_c"],
         articulated=[],
         randomize=[
@@ -413,7 +413,7 @@ SCENES: Dict[int, SceneSpec] = {
     ),
     11: SceneSpec(
         scene_id=11,
-        instruction="Open the black cabinet",
+        instruction="Open the top drawer",
         rigid=[],
         articulated=["cabinet"],
         randomize=[ObjRandom("cabinet", ((0.45, 0.55), (-0.05, 0.12)), yaw=True, yaw_range=(-0.35, 0.35))],
