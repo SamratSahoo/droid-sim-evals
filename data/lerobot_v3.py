@@ -39,6 +39,7 @@ _DATA_SCHEMA = pa.schema(
         ("observation.state.joint_position", pa.list_(pa.float32())),
         ("observation.state.gripper_position", pa.list_(pa.float32())),
         ("observation.state", pa.list_(pa.float32())),
+        ("action.joint_position", pa.list_(pa.float32())),
         ("action.joint_velocity", pa.list_(pa.float32())),
         ("action.gripper_position", pa.list_(pa.float32())),
         ("action", pa.list_(pa.float32())),
@@ -60,6 +61,7 @@ def _feature_dict(height: int, width: int) -> dict:
         "observation.state.joint_position": feat("float32", [7]),
         "observation.state.gripper_position": feat("float32", [1]),
         "observation.state": feat("float32", [8]),
+        "action.joint_position": feat("float32", [7]),
         "action.joint_velocity": feat("float32", [7]),
         "action.gripper_position": feat("float32", [1]),
         "action": feat("float32", [8]),
@@ -143,22 +145,33 @@ class V3DatasetWriter:
         gripper_position: np.ndarray,
         actions: np.ndarray,
         task: str,
+        action_joint_position: np.ndarray | None = None,
     ) -> None:
         """Append one episode.
 
         Args:
             images: {common image key -> [N, H, W, 3] uint8}. Keys must be in VIDEO_KEY_MAP.
             joint_position: [N, 7]; gripper_position: [N, 1]; actions: [N, 8] (joint_velocity[7] + gripper[1]).
+            action_joint_position: [N, 7] COMMANDED/target joint positions (DROID 1.0.1 action.joint_position).
+                If None, falls back to the measured ``joint_position`` (proxy for legacy sources that
+                never recorded commands, e.g. a v2.1 merge input).
             task: language instruction for this episode.
         """
         joint_position = np.asarray(joint_position, dtype=np.float32).reshape(-1, 7)
         gripper_position = np.asarray(gripper_position, dtype=np.float32).reshape(-1, 1)
         actions = np.asarray(actions, dtype=np.float32).reshape(-1, 8)
         n = len(joint_position)
+        if action_joint_position is None:
+            action_joint_position = joint_position  # proxy: measured state (legacy sources w/o commands)
+        else:
+            action_joint_position = np.asarray(action_joint_position, dtype=np.float32).reshape(-1, 7)
         if n == 0:
             return
-        if not (len(gripper_position) == n and len(actions) == n):
-            raise ValueError(f"episode length mismatch: joint={n} gripper={len(gripper_position)} act={len(actions)}")
+        if not (len(gripper_position) == n and len(actions) == n and len(action_joint_position) == n):
+            raise ValueError(
+                f"episode length mismatch: joint={n} gripper={len(gripper_position)} "
+                f"act={len(actions)} act_jp={len(action_joint_position)}"
+            )
 
         episode_index = len(self._episode_rows)
         task_index = self._task_index(task)
@@ -184,6 +197,7 @@ class V3DatasetWriter:
                 "observation.state.joint_position": list(joint_position),
                 "observation.state.gripper_position": list(gripper_position),
                 "observation.state": list(state),
+                "action.joint_position": list(action_joint_position),
                 "action.joint_velocity": list(joint_velocity),
                 "action.gripper_position": list(gripper_action),
                 "action": list(actions),
@@ -267,6 +281,7 @@ class V3DatasetWriter:
 # DROID v3.0 low-dim columns we need + the common frame keys they map to.
 _V3_JOINT = "observation.state.joint_position"
 _V3_GRIPPER = "observation.state.gripper_position"
+_V3_ACT_JP = "action.joint_position"
 _V3_ACT_JV = "action.joint_velocity"
 _V3_ACT_GRIP = "action.gripper_position"
 
@@ -353,6 +368,7 @@ def iter_episodes(repo_id: str) -> Iterator[dict]:
                 for c, f in zip(meta["data/chunk_index"], meta["data/file_index"])
             }
         )
+        has_act_jp = _V3_ACT_JP in info.get("features", {})
         lowdim = [
             _V3_JOINT,
             _V3_GRIPPER,
@@ -360,7 +376,7 @@ def iter_episodes(repo_id: str) -> Iterator[dict]:
             _V3_ACT_GRIP,
             "episode_index",
             "task_index",
-        ]
+        ] + ([_V3_ACT_JP] if has_act_jp else [])
         for rel in data_files:
             low = pq.ParquetFile(fs.open(f"datasets/{repo_id}/{rel}", "rb")).read(columns=lowdim).to_pydict()
             ep_col = np.asarray(low["episode_index"])
@@ -386,11 +402,17 @@ def iter_episodes(repo_id: str) -> Iterator[dict]:
                 ga = np.asarray([low[_V3_ACT_GRIP][i] for i in range(s, e)], dtype=np.float32).reshape(n, 1)
                 jp = np.asarray([low[_V3_JOINT][i] for i in range(s, e)], dtype=np.float32).reshape(n, 7)
                 gp = np.asarray([low[_V3_GRIPPER][i] for i in range(s, e)], dtype=np.float32).reshape(n, 1)
+                ajp = (
+                    np.asarray([low[_V3_ACT_JP][i] for i in range(s, e)], dtype=np.float32).reshape(n, 7)
+                    if has_act_jp
+                    else None
+                )
                 yield {
                     "images": images,
                     "joint_position": jp,
                     "gripper_position": gp,
                     "actions": np.concatenate([jv, ga], axis=1),
+                    "action_joint_position": ajp,
                     "task": str(tasks.get(int(low["task_index"][s]), "")),
                 }
     else:  # v2.1: one inline-image parquet per episode.

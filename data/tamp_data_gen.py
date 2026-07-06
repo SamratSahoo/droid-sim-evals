@@ -839,7 +839,7 @@ def build_lerobot_dataset(
         # Legacy raw episodes without sim_state.npz fall back to the plan-derived state (binary gripper,
         # plan timeline) build so they still assemble, with a warning.
         sim_path = ep / "sim_state.npz"
-        joint_pos = g_state = g_action = vel = None
+        joint_pos = g_state = g_action = vel = cmd_joint = None
         from_sim_state = False
         n = 0
         if sim_path.is_file():
@@ -862,6 +862,7 @@ def build_lerobot_dataset(
                     g_action = g_state
                 dvel = (cj[1:] - cj[:-1]) * FPS  # commanded joint velocity at 15 Hz (~0 during holds)
                 vel = np.concatenate([dvel, np.zeros((1, 7), np.float32)], axis=0).astype(np.float32)
+                cmd_joint = cj  # COMMANDED/target joint positions -> action.joint_position (DROID 1.0.1)
                 from_sim_state = True
             else:
                 logger.warning(f"{ep.name}: sim_state.npz unusable (len={len(sj)}, cmd={None if cj is None else len(cj)}, cmd_grip={None if cg is None else len(cg)}); falling back to plan state")
@@ -876,6 +877,7 @@ def build_lerobot_dataset(
             g_state = grip50[sel].astype(np.float32)
             g_action = grip50[sel].astype(np.float32)  # plan gripper command (binary), same frame, no lead
             vel = vel50[sel].astype(np.float32)
+            cmd_joint = joint_pos  # legacy: plan positions ARE the commanded target -> action.joint_position
         g_action = g_action.astype(np.float32)  # plan gripper command, frame-aligned (no lead, not a proprio copy)
 
         decoded = {}
@@ -909,6 +911,7 @@ def build_lerobot_dataset(
             joint_position=joint_pos[:n],
             gripper_position=g_state[:n].reshape(n, 1),
             actions=ep_actions,
+            action_joint_position=cmd_joint[:n],
             task=task,
         )
         n_written += 1
@@ -954,6 +957,7 @@ def merge_datasets(*, sources: List[str], repo_id: str, push: bool, private: boo
                 joint_position=ep["joint_position"],
                 gripper_position=ep["gripper_position"],
                 actions=ep["actions"],
+                action_joint_position=ep.get("action_joint_position"),
                 task=ep["task"],
             )
             total += 1
