@@ -71,6 +71,10 @@ POLICIES = [
     ("pi05base_d100",              "SamratSahoo/pi05base_d100",              "pi05base-full-d100",             None, "velocity"),
     ("pi05base_d100_toys100_sim",  "SamratSahoo/pi05base_d100_toys100_sim",  "pi05base-full-d100+toys100sim",  None, "velocity"),
     ("pi05base_d100_toys20_sim",   "SamratSahoo/pi05base_d100_toys20_sim",   "pi05base-full-d100+toys20sim",   None, "velocity"),
+    # Full-DROID (streamed) + toys300 sim finetunes with the VAE / RND / VAE+RND manifold-cost planners.
+    ("pi05droid_droidfull_toys300_vae_sim",    "SamratSahoo/pi05droid_droidfull_toys300_vae_sim",    "pi05droid-droid+toys300vaesim-stream",    None, "velocity"),
+    ("pi05droid_droidfull_toys300_rnd_sim",    "SamratSahoo/pi05droid_droidfull_toys300_rnd_sim",    "pi05droid-droid+toys300rndsim-stream",    None, "velocity"),
+    ("pi05droid_droidfull_toys300_vaernd_sim", "SamratSahoo/pi05droid_droidfull_toys300_vaernd_sim", "pi05droid-droid+toys300vaerndsim-stream", None, "velocity"),
     ("pi05_droid_base",            None, "pi05_droid",
      "gs://openpi-assets/checkpoints/pi05_droid", "velocity"),
     ("pi05_droid_jointpos_polaris", None, "pi05_droid_jointpos_polaris",
