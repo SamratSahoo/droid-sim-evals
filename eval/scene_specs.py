@@ -8,11 +8,13 @@ physics (that lives in the ``assets/scene<N>_0.json`` sidecars):
                           articulated: joint positions), matching the sidecar ``name`` fields.
   * ``randomize``       -- per-object start-pose randomization (XY box + optional world-Z yaw),
                           sampled per env each rollout so the 8 rollouts differ.
-  * ``evaluate``        -- a pure-numpy success function (init, final, traj, spec) -> ordered
-                          ``{criterion: value in [0,1]}`` (0/1 for a boolean check, or the FRACTION of
-                          objects satisfying a multi-object check, e.g. 2/3 toys on the plate -> 0.667).
-                          Aggregated by ``score_env`` (on-table gates multiply; sequenced criteria are
-                          credited in order); dense = gated, sequence-credited mean; sparse = all fully met.
+  * ``evaluate``        -- a pure-numpy success function (init, final, traj, spec) -> ``{criterion: 0.0|1.0}``.
+                          Every criterion is an independent BOOLEAN sub-goal worth exactly one whole point --
+                          multi-object checks are split into per-object booleans (no fractions), and there is
+                          NO gate/dependency/sequence. Every criterion is a start-FALSE achievement (a
+                          do-nothing rollout scores 0). ``score_env`` counts them: per-env score = number of
+                          criteria met (a whole number 0..N); success (sparse) = 1 iff ALL are met. The worker
+                          reports mean_points, max_points (=N), success_rate, and dense = mean_points/max_points.
 
 All success checks are *relative* (final/traj vs the measured settled start pose) within an env,
 so the world-frame env-origin offset and the table-top z frame cancel out (same trick as
@@ -128,6 +130,17 @@ def _joint_disp_over_traj(traj: List[dict], name: str, j0: np.ndarray) -> float:
     return best
 
 
+# End-effector + gripper are tracked by the worker under reserved keys ("_ee": wrist-camera world
+# position as an EE proxy; "_gripper": normalized finger, 0 open .. 1 closed) for the PolaRiS-ported
+# reach / release criteria. Object-only evaluators (scenes 6, 10-12) never read them.
+def _ee(state: dict) -> np.ndarray:
+    return np.asarray(state["_ee"]["pos"], dtype=np.float64)
+
+
+def _grip(state: dict) -> float:
+    return float(state["_gripper"]["val"])
+
+
 # --------------------------------------------------------------------------- #
 # Per-scene geometry / thresholds                                               #
 # --------------------------------------------------------------------------- #
@@ -137,26 +150,26 @@ class Geom:
     plate_xy_tol: float = 0.03
     plate_z_tol: float = 0.02
     plate_ang_tol_deg: float = 12.0
-    on_plate_xy: float = 0.11
-    lift_thresh: float = 0.012
+    on_plate_xy: float = 0.11            # default; scenes 6/12 override via meta (plate_radius - item_halfwidth)
+    place_lift: float = 0.008            # final-minus-init z rise for a toy/block to count as placed ONTO the plate
+    lift_thresh: float = 0.012           # (legacy, unused by the new place rubric)
     floor_drop: float = 0.05
     collision_thresh: float = 0.045
-    # push cubes (scene 7)
-    pick_lift_cap: float = 0.03          # neither cube may rise this far (must be pushed, not lifted)
-    touch_dist: float = 0.075            # final center-center xy dist to count as "touching" (0.05 cubes)
-    mover_move_min: float = 0.05         # the pushed cube must translate at least this
-    stayer_move_max: float = 0.045       # the other cube must stay within this
-    # wipe (scene 8)
-    board_half: Tuple[float, float] = (0.16, 0.11)  # whiteboard XY half-extents (over-footprint band)
-    contact_below: float = 0.02          # eraser may dip this far below board center and still "contact"
-    contact_above: float = 0.06          # ...and up to this far above (eraser sitting on the board)
-    grab_lift: float = 0.02              # eraser must rise this far off the table to count as grabbed
-    wipe_len: float = 0.08               # lateral eraser path length while in contact
-    board_move_tol: float = 0.10         # whiteboard may drift this much and still be "on the table"
-    # stack (scene 9)
-    block_size: float = 0.05
-    stack_gap: Tuple[float, float] = (0.030, 0.075)  # allowed consecutive z-gap in a stack
-    stack_xy: float = 0.035              # consecutive blocks must overlap within this XY
+    # reach / grasp / release -- shared by the PolaRiS-ported scenes 8 & 9 (mirrors PolaRiS's
+    # reach / lift / is_within_xy checkers, adapted to our trajectory + wrist-cam-EE framework).
+    reach_thresh: float = 0.05           # TCP (fingertip midpoint) within this of an object = "reached"
+                                         #   (matches PolaRiS reach() default 0.05 m; keyed off the true
+                                         #   grasp point, NOT the wrist camera -- see eval_worker._ee)
+    grab_lift: float = 0.04              # object must rise this far off its start z = "grabbed" (lifted); kept
+                                         #   modest (PolaRiS's lift threshold is small) so it never under-credits
+                                         #   a genuine pick-and-place that is a prerequisite for the *_in_target step
+    grip_open: float = 0.20              # normalized finger (0 open .. 1 closed) below this = gripper released
+    # pan-clean (scene 8 = DROID-PanClean): sponge -> frying pan
+    pan_xy_radius: float = 0.14          # sponge center within this of the pan center = "in the pan"
+    # block-stack-kitchen (scene 9 = DROID-BlockStackKitchen): two cubes -> green tray, green on wood
+    tray_xy_radius: float = 0.12         # cube center within this of the tray center = "in the tray"
+    stack_xy: float = 0.045              # the two cubes' centers within this (xy) = stacked/aligned
+    stack_dz: float = 0.03              # one cube at least this far above the other = stacked (not side-by-side)
     # articulation (scenes 10, 11)
     press_thresh: float = 0.0012         # button press joint |disp| (m) to count as "pressed"
     drawer_thresh: float = 0.03          # cabinet drawer slide |disp| (m) to count as "opened"
@@ -167,111 +180,144 @@ class Geom:
 # Evaluators (init, final, traj, spec) -> ordered {criterion: bool}             #
 # --------------------------------------------------------------------------- #
 def eval_place_on_plate(init, final, traj, spec) -> Dict[str, float]:
-    """Scenes 6 & 12: plate stays put, every item ends lifted onto the plate, none colliding, all on table."""
+    """Scenes 6 & 12: place each item on the plate. Independent boolean whole-point criteria (no gate, no
+    partial, no start-satisfiable free points):
+
+      <item>_on_plate  : ended lifted onto the plate AND fully over the plate AND the gripper released --
+                         (final_z - init_z) > place_lift AND ||item_final_xy - plate_FINAL_xy|| < on_plate_xy
+                         AND _grip(final) < grip_open.  FINAL-minus-init z (never max-over-traj), so a toy held
+                         aloft in a closed gripper or merely bumped mid-episode does NOT count as placed.
+      <item>_lifted    : ever picked up (max rise over the episode > grab_lift) -- ranks pick-succeeds/place-fails.
+      items_spaced_on_plate (optional, spec.meta["score_spacing"]) : >=2 items on the plate AND every on-plate
+                         pair is > spaced_thresh apart -- honours the 'no collisions' clause as ONE separate
+                         boolean (NOT folded into placement, which would non-monotonically zero both of a
+                         touching pair).
+
+    No plate_unmoved / on_table / gate: placement is measured against the plate's FINAL pose, so shoving the
+    plate earns no credit; a floored item simply fails its own placement. All checks are frame-relative.
+    """
     g = spec.geom
-    plate = spec.meta["plate"]
-    items = spec.meta["items"]
-    p0, pf = _pos(init, plate), _pos(final, plate)
-    plate_unmoved = (np.linalg.norm(pf[:2] - p0[:2]) < g.plate_xy_tol
-                     and abs(pf[2] - p0[2]) < g.plate_z_tol
-                     and quat_angle_deg(init[plate]["quat"], final[plate]["quat"]) < g.plate_ang_tol_deg)
-    on_plate, on_table, item_xy = [], [], []
+    plate, items = spec.meta["plate"], spec.meta["items"]
+    on_plate_xy = spec.meta.get("on_plate_xy", g.on_plate_xy)
+    place_lift = spec.meta.get("place_lift", g.place_lift)
+    pf = _pos(final, plate)
+    released = _grip(final) < g.grip_open
+    out: Dict[str, float] = {}
+    placed_xy: Dict[str, np.ndarray] = {}
     for it in items:
         t0, tf = _pos(init, it), _pos(final, it)
-        item_xy.append(tf[:2])
-        d = float(np.linalg.norm(tf[:2] - pf[:2]))
-        on_plate.append(d < g.on_plate_xy and (tf[2] - t0[2]) > g.lift_thresh)
-        on_table.append((tf[2] - t0[2]) > -g.floor_drop)
-    pair_clear = [float(np.linalg.norm(item_xy[i] - item_xy[j]) > g.collision_thresh)
-                  for i in range(len(items)) for j in range(i + 1, len(items))]
+        on_plate = ((tf[2] - t0[2]) > place_lift
+                    and float(np.linalg.norm(tf[:2] - pf[:2])) < on_plate_xy
+                    and released)
+        out[f"{it}_on_plate"] = float(on_plate)
+        if on_plate:
+            placed_xy[it] = tf[:2]
+    for it in items:
+        out[f"{it}_lifted"] = float(_lift_over_traj(list(traj) + [final], it, float(_pos(init, it)[2])) > g.grab_lift)
+    if spec.meta.get("score_spacing"):
+        spaced_thresh = spec.meta.get("spaced_thresh", 2.0 * g.collision_thresh)
+        pl = list(placed_xy.values())
+        spaced = len(pl) >= 2 and all(
+            float(np.linalg.norm(pl[i] - pl[j])) > spaced_thresh
+            for i in range(len(pl)) for j in range(i + 1, len(pl)))
+        out["items_spaced_on_plate"] = float(spaced)
+    return out
+
+
+def eval_pan_clean(init, final, traj, spec) -> Dict[str, float]:
+    """Scene 8 = DROID-PanClean: pick up the sponge and put it in the frying pan. Boolean whole-point criteria:
+
+      sponge_lifted : sponge ever picked up (max rise over the episode > grab_lift).
+      sponge_in_pan : sponge was lifted AND ended within the pan disk in xy AND did NOT end on the floor --
+                      (lift prerequisite folded in, so sponge_in_pan implies sponge_lifted => a monotone 0/1/2
+                      ladder and no pure-table-shove credit; the floor guard re-folds the dropped on_table check).
+
+    No gripper-release clause (unreliable finger angle on a compressible sponge, breaks monotonicity), no
+    pan_unmoved (the pan is kinematic -> a start-true free point). All checks frame-relative; 0/2 at t=0.
+    NB: PolaRiS's reach() predicate stays dropped (no ee_frame at the grasp point; see eval_worker._ee /
+    results["min_tcp_dist"]).
+    """
+    g = spec.geom
+    sponge, pan = spec.meta["item"], spec.meta["target"]
+    pan_xy_radius = spec.meta.get("pan_xy_radius", g.pan_xy_radius)
+    z0 = float(_pos(init, sponge)[2])
+    lifted = _lift_over_traj(list(traj) + [final], sponge, z0) > g.grab_lift
+    sf = _pos(final, sponge)
+    in_pan = (lifted
+              and float(np.linalg.norm(sf[:2] - _pos(final, pan)[:2])) < pan_xy_radius
+              and (sf[2] - z0) > -g.floor_drop)
+    return {"sponge_lifted": float(lifted), "sponge_in_pan": float(in_pan)}
+
+
+def eval_block_stack_kitchen(init, final, traj, spec) -> Dict[str, float]:
+    """Scene 9 = DROID-BlockStackKitchen: place both cubes in the green tray and stack them. Boolean whole-point:
+
+      <cube>_lifted   : cube ever picked up (max rise over the episode > grab_lift).
+      <cube>_in_tray  : cube was lifted AND ended over the tray footprint AND the gripper released --
+                        (lift folded in, replacing the old dep, so a pushed-never-picked cube does not count).
+      blocks_stacked  : at FINAL, one cube above the other (|dz| > stack_dz) AND xy-aligned (< stack_xy) AND
+                        the LOWER cube over the tray footprint AND released -- so a stack must be ON the tray,
+                        not merely somewhere on the table.
+
+    Placement/stack read the FINAL settled state (not 'ever', which latches a momentary carry-over); *_lifted
+    is ever/latched. No tray_unmoved (tray is kinematic) / no on_table gate. All checks frame-relative; 0/5 at t=0.
+    """
+    g = spec.geom
+    green, wood, tray = spec.meta["green"], spec.meta["wood"], spec.meta["target"]
+    tray_r = spec.meta.get("tray_xy_radius", g.tray_xy_radius)
+    seq = list(traj) + [final]
+    tf = _pos(final, tray)
+    released = _grip(final) < g.grip_open
+
+    def over_tray(name: str) -> bool:
+        return float(np.linalg.norm(_pos(final, name)[:2] - tf[:2])) < tray_r
+
+    green_lifted = _lift_over_traj(seq, green, float(_pos(init, green)[2])) > g.grab_lift
+    wood_lifted = _lift_over_traj(seq, wood, float(_pos(init, wood)[2])) > g.grab_lift
+    gf, wf = _pos(final, green), _pos(final, wood)
+    lower = green if gf[2] <= wf[2] else wood
+    stacked = (abs(gf[2] - wf[2]) > g.stack_dz
+               and float(np.linalg.norm(gf[:2] - wf[:2])) < g.stack_xy
+               and over_tray(lower) and released)
     return {
-        "plate_unmoved": float(plate_unmoved),
-        "items_on_plate": float(np.mean(on_plate)),                  # fraction of items lifted onto the plate
-        "no_collision": float(np.mean(pair_clear)) if pair_clear else 1.0,  # fraction of item pairs not colliding
-        "items_on_table": float(np.mean(on_table)),                  # fraction of items still on the table
+        "green_lifted": float(green_lifted),
+        "wood_lifted": float(wood_lifted),
+        "green_in_tray": float(green_lifted and over_tray(green) and released),
+        "wood_in_tray": float(wood_lifted and over_tray(wood) and released),
+        "blocks_stacked": float(stacked),
     }
 
 
-def eval_push_cubes(init, final, traj, spec) -> Dict[str, float]:
-    """Scene 7: robot PUSHES the yellow cube into the (stationary) red cube; nothing gets lifted."""
-    g = spec.geom
-    mover, stayer = spec.meta["mover"], spec.meta["stayer"]
-    z0_m, z0_s = float(_pos(init, mover)[2]), float(_pos(init, stayer)[2])
-    not_picked_up = float(np.mean([_lift_over_traj(traj, mover, z0_m) < g.pick_lift_cap,
-                                   _lift_over_traj(traj, stayer, z0_s) < g.pick_lift_cap]))
-    touching = float(np.linalg.norm(_pos(final, mover)[:2] - _pos(final, stayer)[:2])) < g.touch_dist
-    mover_d = float(np.linalg.norm(_pos(final, mover)[:2] - _pos(init, mover)[:2]))
-    stayer_d = float(np.linalg.norm(_pos(final, stayer)[:2] - _pos(init, stayer)[:2]))
-    mover_pushed = mover_d > g.mover_move_min and stayer_d < g.stayer_move_max
-    on_table = float(np.mean([(_pos(final, mover)[2] - z0_m) > -g.floor_drop,
-                              (_pos(final, stayer)[2] - z0_s) > -g.floor_drop]))
-    return {
-        "not_picked_up": not_picked_up,          # fraction of cubes never lifted
-        "cubes_touching": float(touching),
-        "yellow_is_mover": float(mover_pushed),
-        "cubes_on_table": on_table,              # fraction of cubes still on the table
-    }
+def eval_articulation(init, final, traj, spec) -> Dict[str, float]:
+    """Scenes 10 & 11: actuate ONE named DOF of a world-anchored articulation. Two nested thresholds give a
+    0/1/2 ordinal (contacted/cracked < pressed/opened) so the scene has real partial-credit resolution.
 
+    The DOF is resolved by NAME (``meta["target_joint"]``) from the articulation's joint_names (robust to
+    MJCF->USD reordering), and only that DOF is scored -- so opening the WRONG drawer does NOT count. Both the
+    button press and the drawer open move the joint in the NEGATIVE direction from its settled rest, so the
+    actuation displacement is ``j0 - j`` (positive when actuated); an inward push (opposite sign) never counts.
 
-def eval_wipe(init, final, traj, spec) -> Dict[str, float]:
-    """Scene 8: grab the eraser, wipe it across the (flat) whiteboard in contact, leave both settled."""
-    g = spec.geom
-    board, eraser = spec.meta["board"], spec.meta["eraser"]
-    z0_e = float(_pos(init, eraser)[2])
-    grabbed = _lift_over_traj(traj, eraser, z0_e) > g.grab_lift
+      mode "traj_excl_final" (scene 10 button, spring-return): MAX (j0 - j) over ``traj`` EXCLUDING final --
+                             the spring relaxes the cap to ~0 after release, so a final-state check would miss
+                             a valid press-and-release.
+      mode "final"          (scene 11 drawer, no return spring): (j0 - j) at the FINAL settled state -- rejects
+                             a transient bump-then-close and credits an end-open drawer.
 
-    # Frames where the eraser is horizontally over the board AND at board-surface height ("in contact").
-    hx, hy = g.board_half
-    contact_xy = []
-    for s in traj:
-        be, br = _pos(s, eraser), _pos(s, board)
-        dz = be[2] - br[2]
-        if abs(be[0] - br[0]) < hx and abs(be[1] - br[1]) < hy and -g.contact_below < dz < g.contact_above:
-            contact_xy.append(be[:2])
-    touches_board = len(contact_xy) >= 1
-    wipe_path = sum(float(np.linalg.norm(contact_xy[k + 1] - contact_xy[k])) for k in range(len(contact_xy) - 1))
-    wiping = wipe_path > g.wipe_len
-
-    b0, bf = _pos(init, board), _pos(final, board)
-    board_on_table = np.linalg.norm(bf[:2] - b0[:2]) < g.board_move_tol and (bf[2] - b0[2]) > -g.floor_drop
-    eraser_ok = (_pos(final, eraser)[2] - z0_e) > -g.floor_drop   # ended in gripper / on table / on board
-    return {
-        "grabbed_eraser": float(grabbed),
-        "wiping_motion": float(wiping),
-        "eraser_touched_board": float(touches_board),
-        "board_on_table": float(board_on_table),
-        "eraser_settled": float(eraser_ok),
-    }
-
-
-def eval_stack(init, final, traj, spec) -> Dict[str, float]:
-    """Scene 9: all blocks end on the table AND form a vertical stack (partial credit per stacked link)."""
-    g = spec.geom
-    blocks = spec.meta["blocks"]
-    on_table = float(np.mean([(_pos(final, b)[2] - _pos(init, b)[2]) > -g.floor_drop for b in blocks]))
-    fp = [_pos(final, b) for b in blocks]
-    lo, hi = g.stack_gap
-    # Partial credit: a block counts as stacked if some OTHER block sits ~one block-height below it and is
-    # xy-aligned. A perfect stack of N has N-1 such blocks (all but the bottom), so normalize by (N-1).
-    resting = sum(
-        any(i != j and lo < (fp[i][2] - fp[j][2]) < hi and np.linalg.norm(fp[i][:2] - fp[j][:2]) < g.stack_xy
-            for j in range(len(fp)))
-        for i in range(len(fp))
-    )
-    stacked = float(resting) / (len(fp) - 1) if len(fp) > 1 else 1.0
-    return {"blocks_on_table": on_table, "blocks_stacked": stacked}
-
-
-def eval_articulation(init, final, traj, spec) -> Dict[str, bool]:
-    """Scenes 10 & 11: the articulation moves non-trivially during the episode; its base stays on the table."""
-    g = spec.geom
-    name = spec.meta["art"]
-    thresh = spec.meta["move_thresh"]
-    j0 = np.asarray(init[name]["joint"], dtype=np.float64)
-    moved = _joint_disp_over_traj(traj, name, j0) > thresh
-    b0, bf = _pos(init, name), _pos(final, name)
-    on_table = np.linalg.norm(bf[:2] - b0[:2]) < g.base_move_tol and (bf[2] - b0[2]) > -g.floor_drop
-    return {spec.meta["move_crit"]: float(moved), spec.meta["table_crit"]: float(on_table)}
+    No *_on_table criterion (the base is fix_base / world-anchored -> always true -> a start-satisfied free
+    point). Frame-relative (an intrinsic joint DOF is independent of env origin, table height, base pose);
+    0 at t=0 (disp == 0 when settled).
+    """
+    m = spec.meta
+    art = m["art"]
+    names = list(init[art]["joint_names"])
+    idx = names.index(m["target_joint"])
+    j0 = float(np.asarray(init[art]["joint"], dtype=np.float64)[idx])
+    if m.get("mode", "final") == "final":
+        disp = j0 - float(np.asarray(final[art]["joint"], dtype=np.float64)[idx])
+    else:  # traj_excl_final
+        disp = max((j0 - float(np.asarray(s[art]["joint"], dtype=np.float64)[idx]) for s in traj), default=0.0)
+    return {m["contact_crit"]: float(disp > m["contact_thresh"]),
+            m["move_crit"]: float(disp > m["move_thresh"])}
 
 
 # --------------------------------------------------------------------------- #
@@ -287,63 +333,40 @@ class SceneSpec:
     evaluate: Callable
     geom: Geom = field(default_factory=Geom)
     meta: dict = field(default_factory=dict)
-    # Scoring structure (see score_env):
-    #   gates    -- criteria that act as a MULTIPLIER on the env's dense score (x1 met / x0 not), rather
-    #               than an additive term. None -> auto: every criterion whose name ends in "_on_table"
-    #               (so knocking an object off the table zeroes that env's score).
-    #   sequence -- ordered prerequisite chain: a criterion is credited only if every EARLIER criterion
-    #               in the chain was met (e.g. "eraser_settled" counts only after "wiping_motion").
-    gates: Optional[List[str]] = None
-    sequence: List[str] = field(default_factory=list)
 
     @property
     def objects(self) -> List[str]:
         return self.rigid + self.articulated
 
-    @property
-    def gate_criteria(self) -> Optional[List[str]]:
-        return self.gates
 
+def score_env(raw: Dict[str, float], spec: "SceneSpec") -> dict:
+    """One env's boolean criteria -> a WHOLE-NUMBER score.
 
-def resolve_gates(spec: "SceneSpec", criteria: List[str]) -> List[str]:
-    """Which criteria are multiplicative gates (explicit ``spec.gates`` or every ``*_on_table``)."""
-    return spec.gates if spec.gates is not None else [c for c in criteria if c.endswith("_on_table")]
-
-
-def score_env(raw: Dict[str, bool], spec: "SceneSpec") -> dict:
-    """Turn one env's raw {criterion: bool} into dense/sparse scores + the credited per-criterion values.
-
-    Each criterion value is in [0, 1] -- 0/1 for a boolean check, or the FRACTION of objects satisfying a
-    multi-object check (e.g. 2/3 toys on the plate -> 0.667).
-
-    dense  = (product of gate criteria) * (mean of the CREDITED non-gate criteria). A gate contributes its
-             fractional value (all objects on the table -> x1; one of three knocked off -> x2/3; all off -> x0).
-             A criterion in ``spec.sequence`` is scaled by the product of its earlier chain members, so a
-             later step cannot earn more credit than the prerequisites it depends on (bool chains reduce to
-             the usual AND; fractional prerequisites scale downstream credit).
-    sparse = 1.0 iff EVERY criterion is fully met (== 1.0) -- a perfect env.
+    Every criterion is an independent boolean sub-goal worth exactly one point (no gate, no partial credit,
+    no dependency chaining). ``points`` = COUNT of criteria met (an integer 0..N); ``success`` = 1 iff ALL
+    criteria are met. The ``>= 0.5`` collapse is a defensive guard so that even if an evaluator ever returned
+    a fractional value the per-rollout score stays an integer. Every declared criterion is a start-FALSE
+    achievement (a do-nothing rollout scores 0), so the count is not inflated by preserved start conditions.
     """
-    criteria = list(raw)
-    gates = resolve_gates(spec, criteria)
-    gate = 1.0
-    for g_ in gates:
-        gate *= float(raw[g_])
-    credited = {c: float(raw[c]) for c in criteria}
-    prefix = 1.0
-    for c in spec.sequence:                      # scale each chain member by the product of earlier members
-        credited[c] = float(raw[c]) * prefix
-        prefix *= float(raw[c])
-    task = [c for c in criteria if c not in gates]
-    dense = gate * (float(np.mean([credited[c] for c in task])) if task else 1.0)
-    sparse = 1.0 if all(float(raw[c]) >= 1.0 - 1e-9 for c in criteria) else 0.0
-    return {"dense": dense, "sparse": sparse, "credited": credited, "gates": gates}
+    met = {c: (1 if float(raw[c]) >= 0.5 else 0) for c in raw}
+    points = int(sum(met.values()))
+    max_points = len(met)
+    return {"points": points, "max_points": max_points,
+            "success": 1 if (max_points > 0 and points == max_points) else 0, "met": met}
 
 
 # Reachable-workspace XY boxes (env-local / robot frame, metres) live in each ObjRandom below.
-# They mirror the scene6/7 sidecars' placement region (x~[0.30,0.60], y~[-0.12,0.24]).
+# They mirror the scene6 sidecar's placement region (x~[0.30,0.60], y~[-0.12,0.24]).
 _TOY_BOX = ((0.30, 0.60), (-0.10, 0.22))
 _PLATE_BOX = ((0.40, 0.55), (-0.05, 0.20))
 _R = 0.1125 + 0.045 + 0.02   # plate_radius + toy/block radius + margin (toys must start off the plate)
+# PolaRiS-ported scenes (8, 9). Boxes keep the pick objects off the fixed target and in the FOV;
+# see the assets/scene8_0.json / scene9_0.json sidecars for the matching object layout.
+_SPONGE_BOX = ((0.31, 0.36), (-0.11, -0.01))    # scene 8: sponge start region (front-left corner, clear of
+                                                #   the pan-avoid ring AND the back-left distractors)
+_TRAY_BOX = ((0.47, 0.52), (0.06, 0.13))        # scene 9: light tray jitter (kinematic target)
+_CUBE_BOX = ((0.31, 0.41), (-0.10, 0.10))       # scene 9: cube start region (left of the tray)
+_TRAY_R = 0.15                                   # cubes must start this far from the tray centre (off it)
 
 SCENES: Dict[int, SceneSpec] = {
     6: SceneSpec(
@@ -358,48 +381,41 @@ SCENES: Dict[int, SceneSpec] = {
             ObjRandom("pink_toy", _TOY_BOX, yaw=True, min_sep=0.05, avoid=(("plate", _R),)),
         ],
         evaluate=eval_place_on_plate,
-        meta={"plate": "plate", "items": ["blue_toy", "brown_toy", "pink_toy"]},
+        # on_plate_xy = plate_radius(~0.1125) - toy_halfwidth(~0.045); toys are scale-0.045 rigid.
+        # Criteria (max 7): {blue,brown,pink}_toy_on_plate, {..}_lifted, items_spaced_on_plate.
+        meta={"plate": "plate", "items": ["blue_toy", "brown_toy", "pink_toy"],
+              "on_plate_xy": 0.067, "place_lift": 0.008, "score_spacing": True, "spaced_thresh": 0.09},
     ),
-    7: SceneSpec(
-        scene_id=7,
-        instruction="Push the yellow block into the red block.",
-        rigid=["red_cube", "yellow_cube"],
-        articulated=[],
-        randomize=[
-            ObjRandom("red_cube", ((0.40, 0.55), (0.10, 0.22)), yaw=True),
-            ObjRandom("yellow_cube", ((0.40, 0.55), (-0.12, 0.04)), yaw=True, min_sep=0.10),
-        ],
-        evaluate=eval_push_cubes,
-        meta={"mover": "yellow_cube", "stayer": "red_cube"},
-        # A valid push is ordered: don't lift -> move the yellow cube -> end touching. cubes_on_table gates.
-        sequence=["not_picked_up", "yellow_is_mover", "cubes_touching"],
-    ),
+    # Scene 7 (push cubes) was removed. Scenes 8 & 9 are ported from PolaRiS (owhan/PolaRiS-Hub):
     8: SceneSpec(
         scene_id=8,
-        instruction="Use the eraser to wipe the whiteboard.",
-        rigid=["whiteboard", "eraser"],
+        instruction="Use the yellow sponge to scrub the blue handle frying pan.",
+        rigid=["pan", "sponge"],            # the pan is a fixed kinematic target; distractors (sidecar) are untracked
         articulated=[],
         randomize=[
-            ObjRandom("whiteboard", ((0.42, 0.52), (0.02, 0.16))),          # no yaw (per design)
-            ObjRandom("eraser", ((0.30, 0.40), (-0.12, 0.06)), yaw=True, avoid=(("whiteboard", 0.20),)),
+            # Only the sponge is randomized (PolaRiS pan_clean varies only the sponge pose); it must start
+            # off the pan and in the front-left reach region.
+            ObjRandom("sponge", _SPONGE_BOX, yaw=True, avoid=(("pan", 0.15),)),
         ],
-        evaluate=eval_wipe,
-        meta={"board": "whiteboard", "eraser": "eraser"},
-        # Ordered wipe: grab -> touch the board -> wipe across it -> leave the eraser settled. board_on_table gates.
-        sequence=["grabbed_eraser", "eraser_touched_board", "wiping_motion", "eraser_settled"],
+        evaluate=eval_pan_clean,
+        # pan_xy_radius tightened toward the true pan interior (scale 0.35). Criteria: sponge_lifted, sponge_in_pan.
+        meta={"item": "sponge", "target": "pan", "pan_xy_radius": 0.12},
     ),
     9: SceneSpec(
         scene_id=9,
-        instruction="Stack the blocks together",
-        rigid=["block_a", "block_b", "block_c"],
+        instruction="Place and stack the blocks on top of the green tray.",
+        rigid=["tray", "green_cube", "wood_cube"],   # tray = fixed kinematic target; distractors untracked
         articulated=[],
         randomize=[
-            ObjRandom("block_a", _TOY_BOX, yaw=True, min_sep=0.09),
-            ObjRandom("block_b", _TOY_BOX, yaw=True, min_sep=0.09),
-            ObjRandom("block_c", _TOY_BOX, yaw=True, min_sep=0.09),
+            ObjRandom("tray", _TRAY_BOX),                                              # light target jitter (placed first)
+            ObjRandom("green_cube", _CUBE_BOX, yaw=True, min_sep=0.09, avoid=(("tray", _TRAY_R),)),
+            ObjRandom("wood_cube", _CUBE_BOX, yaw=True, min_sep=0.09, avoid=(("tray", _TRAY_R),)),
         ],
-        evaluate=eval_stack,
-        meta={"blocks": ["block_a", "block_b", "block_c"]},
+        evaluate=eval_block_stack_kitchen,
+        # tray_xy_radius shrunk from 0.12 (isotropic) toward the tray's short half-extent so a cube pushed
+        # against the short edge onto bare table no longer counts. Criteria: {green,wood}_lifted,
+        # {green,wood}_in_tray, blocks_stacked (stack must sit over the tray).
+        meta={"green": "green_cube", "wood": "wood_cube", "target": "tray", "tray_xy_radius": 0.085},
     ),
     10: SceneSpec(
         scene_id=10,
@@ -408,8 +424,11 @@ SCENES: Dict[int, SceneSpec] = {
         articulated=["button"],
         randomize=[ObjRandom("button", ((0.42, 0.55), (-0.08, 0.18)), yaw=True)],
         evaluate=eval_articulation,
-        meta={"art": "button", "move_thresh": Geom.press_thresh, "move_crit": "button_pressed",
-              "table_crit": "button_on_table"},
+        # Single prismatic DOF 'press_joint' (range -8..0 authored x scale ~3mm; press = negative). Spring
+        # returns the cap after release -> score MAX over traj EXCLUDING final. Nested: contacted < pressed.
+        meta={"art": "button", "target_joint": "press_joint", "mode": "traj_excl_final",
+              "move_crit": "button_pressed", "move_thresh": Geom.press_thresh,
+              "contact_crit": "button_contacted", "contact_thresh": Geom.press_thresh / 3.0},
     ),
     11: SceneSpec(
         scene_id=11,
@@ -418,8 +437,11 @@ SCENES: Dict[int, SceneSpec] = {
         articulated=["cabinet"],
         randomize=[ObjRandom("cabinet", ((0.45, 0.55), (-0.05, 0.12)), yaw=True, yaw_range=(-0.35, 0.35))],
         evaluate=eval_articulation,
-        meta={"art": "cabinet", "move_thresh": Geom.drawer_thresh, "move_crit": "drawer_opened",
-              "table_crit": "cabinet_on_table"},
+        # ONLY the top drawer's slide DOF 'top_level' is scored (opening middle/bottom must NOT count).
+        # Drawers have no return spring -> score the FINAL settled state. Open = negative. Nested: cracked < opened.
+        meta={"art": "cabinet", "target_joint": "top_level", "mode": "final",
+              "move_crit": "top_drawer_opened", "move_thresh": Geom.drawer_thresh,
+              "contact_crit": "drawer_cracked", "contact_thresh": Geom.drawer_thresh / 3.0},
     ),
     12: SceneSpec(
         scene_id=12,
@@ -433,7 +455,11 @@ SCENES: Dict[int, SceneSpec] = {
             ObjRandom("block_c", _TOY_BOX, yaw=True, min_sep=0.06, avoid=(("plate", _R),)),
         ],
         evaluate=eval_place_on_plate,
-        meta={"plate": "plate", "items": ["block_a", "block_b", "block_c"]},
+        # 0.05 m cubes on a convexDecomposition plate (concave rim survives -> lower inner floor than scene 6's
+        # convexHull, so place_lift is smaller). on_plate_xy = plate_radius - block_halfwidth(~0.025).
+        # Criteria (max 7): {block_a,b,c}_on_plate, {..}_lifted, items_spaced_on_plate.
+        meta={"plate": "plate", "items": ["block_a", "block_b", "block_c"],
+              "on_plate_xy": 0.088, "place_lift": 0.005, "score_spacing": True, "spaced_thresh": 0.052},
     ),
 }
 

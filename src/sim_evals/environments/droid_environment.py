@@ -269,11 +269,17 @@ class SceneCfg(InteractiveSceneCfg):
             if kind == "usd_rigid":
                 # Reference a textured USD/USDZ asset directly (keeps its scanned material/
                 # textures) as a rigid body with a convex collider; scale/pose from the sidecar.
-                s = float(obj.get("scale", 1.0))
+                # ``scale`` may be a scalar (uniform) or a [sx,sy,sz] triple (non-uniform, e.g.
+                # PolaRiS's sponge 0.09/0.07/0.09). ``kinematic: true`` makes it a fixed, world-
+                # anchored target (used for the scene-8 pan / scene-9 tray) that the arm cannot
+                # knock away -- it keeps a collider (objects still rest on/in it) but never falls
+                # or moves, so its randomized/authored pose is exactly the pose read back.
+                sc = obj.get("scale", 1.0)
+                scale = tuple(float(v) for v in sc) if isinstance(sc, (list, tuple)) else (float(sc),) * 3
                 spawn = UsdRigidCfg(
                     usd_path=str((DATA_PATH / obj["usd"]).resolve()),
-                    scale=(s, s, s),
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+                    scale=scale,
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=obj.get("kinematic", False)),
                     collision_props=sim_utils.CollisionPropertiesCfg(),
                     mass_props=sim_utils.MassPropertiesCfg(mass=obj.get("mass", 0.03)),
                     collision_approximation=obj.get("collision", "convexHull"),
@@ -333,8 +339,8 @@ class SceneCfg(InteractiveSceneCfg):
 
             if kind == "box":
                 # A simple colored rigid cuboid spawned via Isaac's native cuboid mesh path
-                # (no mesh asset needed) -- used by scene 7's two separated push cubes. Same
-                # physics knobs as the "rigid" branch; a box is convex so the default
+                # (no mesh asset needed) -- a generic primitive for quick colored-block scenes.
+                # Same physics knobs as the "rigid" branch; a box is convex so the default
                 # convexHull collider is exact.
                 size = tuple(obj.get("size", (0.05, 0.05, 0.05)))
                 rp = obj.get("rigid", {})

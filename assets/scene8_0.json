@@ -1,27 +1,46 @@
 {
-  "_comment": "Scene 8 (wipe the whiteboard). Base scene8_0.usd = empty table+dome+robot (copy of scene7_0.usd). Whiteboard + eraser are scanned Sketchfab USDZ (metersPerUnit ignored by Isaac -> scale ~6.4e-4/2.0e-4; upAxis=Y). Whiteboard lies FLAT (thin raw-Z axis -> world Z, so rot=identity); eraser stands thin-axis-up (rot 90deg about X). Scales/extents from assets/custom/processed_assets.json. Table-top collider surface ~z=0.045; objects placed a bit above to settle. NOTE: verify board flatness + eraser graspability in the smoke render; the eraser scan is near-cubic, fall back to kind:box if its convex-hull collider is unusable.",
+  "_comment": "Scene 8 = DROID-PanClean (ported from PolaRiS owhan/PolaRiS-Hub `pan_clean`). Task: 'Use the yellow sponge to scrub the blue handle frying pan' -- pick up the sponge and put it in the frying pan. Objects are PolaRiS's scanned USDZ meshes (custom/pan_clean/) spawned via kind:'usd_rigid'; the frying pan is the fixed TARGET (kinematic, like PolaRiS's kinematicEnabled pan) so it cannot be knocked away, and the sponge is the pick object (randomized per env, see eval/scene_specs.py::SCENES[8]). We keep PolaRiS's per-object scales (the USDZ meshes are in arbitrary units); non-uniform scale (sponge) is supported. All meshes are XY-centered with their base at local z=0, so pos.z = table-top rest height (our table top ~0.045-0.05). Base scene8_0.usd = empty table+dome+robot. NOTE: this is a first-cut layout adapted to our smaller workspace (x~[0.30,0.60], y~[-0.12,0.24]); verify object placement / sponge graspability / pan reach in a smoke render and nudge poses if needed. Distractors are a curated subset of PolaRiS's clutter (full library in custom/pan_clean/).",
   "objects": [
     {
-      "name": "whiteboard",
+      "name": "pan",
       "kind": "usd_rigid",
-      "usd": "custom/whiteboard/Whiteboard.usdz",
-      "scale": 0.000642,
-      "pos": [0.47, 0.10, 0.06],
-      "rot": [1.0, 0.0, 0.0, 0.0],
+      "usd": "custom/pan_clean/frying_pan.usdz",
+      "scale": 0.35,
+      "pos": [0.50, 0.06, 0.05],
+      "rot": [0.70710678, 0.0, 0.0, 0.70710678],
+      "kinematic": true,
       "mass": 2.0,
-      "collision": "convexHull",
-      "rigid": {"static_friction": 1.0, "dynamic_friction": 0.9}
+      "collision": "convexHull"
     },
     {
-      "name": "eraser",
+      "name": "sponge",
       "kind": "usd_rigid",
-      "usd": "custom/whiteboard/Whiteboard_Eraser.usdz",
-      "scale": 0.0002,
-      "pos": [0.34, -0.03, 0.10],
-      "rot": [0.70710678, 0.70710678, 0.0, 0.0],
+      "usd": "custom/pan_clean/sponge.usdz",
+      "scale": [0.09, 0.07, 0.09],
+      "pos": [0.33, -0.06, 0.055],
+      "rot": [1.0, 0.0, 0.0, 0.0],
       "mass": 0.05,
-      "collision": "convexHull",
-      "rigid": {"static_friction": 0.9, "dynamic_friction": 0.8}
+      "collision": "convexHull"
+    },
+    {
+      "name": "coke",
+      "kind": "usd_rigid",
+      "usd": "custom/pan_clean/coke.usdz",
+      "scale": 0.09,
+      "pos": [0.32, 0.10, 0.055],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "mass": 0.12,
+      "collision": "convexHull"
+    },
+    {
+      "name": "bell_pepper",
+      "kind": "usd_rigid",
+      "usd": "custom/pan_clean/bell_pepper.usdz",
+      "scale": 0.08,
+      "pos": [0.32, 0.21, 0.055],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "mass": 0.1,
+      "collision": "convexHull"
     }
   ]
 }

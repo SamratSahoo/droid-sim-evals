@@ -73,15 +73,13 @@ DEFAULT_INSTRUCTIONS = {
     4: "Put the cube on the mug and the cans in the bowl.",
     5: "Put 3 blocks in the bowl.",
     6: "Place the toys on the plate with no collisions",
-    7: "Push the yellow cube next to the red cube",
 }
 
 # Some tasks reuse another scene's geometry with a different instruction. Maps a task id
 # (used for the instruction and the output filenames) to the scene<N>_<variant>.usd loaded
-# for it; task ids not listed here load scene<id>_<variant>.usd as usual. (Task 7 -- a "push
-# the yellow cube next to the red cube" task -- now has its OWN geometry: scene7_0.usd (the
-# scene6 empty base) + a scene7_0.json sidecar spawning a red + a yellow cube, so it is not
-# remapped here anymore.)
+# for it; task ids not listed here load scene<id>_<variant>.usd as usual. (Scenes 8+ -- the
+# PolaRiS-ported and articulation tasks -- are driven by eval/eval_pi05_policies.py, not this
+# side-by-side comparison harness.)
 SCENE_GEOMETRY = {}
 
 KNOWN_POLICIES = ("pi05", "tiptop")
@@ -236,7 +234,8 @@ def run_worker(
     )
 
     env_cfg = parse_env_cfg("DROID", device=args_cli.device, num_envs=1, use_fabric=True)
-    # Most tasks load scene<worker_scene>; a few (e.g. task 7) reuse another scene's geometry.
+    # Each task loads scene<worker_scene>; SCENE_GEOMETRY may remap a task id to another scene's
+    # geometry (currently empty -> every task loads its own scene<worker_scene>_<variant>.usd).
     env_cfg.set_scene(SCENE_GEOMETRY.get(worker_scene, str(worker_scene)), variant)
     # Eval renders at full sensor resolution; data generation defaults to 180x320 for render speed.
     set_camera_resolution(env_cfg, 720, 1280)
@@ -834,8 +833,9 @@ def main(
     """Run Pi-0.5 and tiptop across scenes and produce side-by-side comparison videos.
 
     Args:
-        scenes: Scene numbers to evaluate (each yields one comparison video). Task 7
-            reuses Scene 5's geometry with a "push the cubes together" instruction.
+        scenes: Scene numbers to evaluate (each yields one comparison video). This
+            side-by-side pi05-vs-tiptop harness covers scenes 1-6; the PolaRiS-ported
+            scenes 8-9 and articulation scenes 10-12 are driven by eval_pi05_policies.py.
         variant: Scene variant index (object configuration).
         mode: Server scheduling: ``auto`` | ``concurrent`` | ``alternating``.
         policies: Which policies to run (``pi05``, ``tiptop``). Stitching needs both.

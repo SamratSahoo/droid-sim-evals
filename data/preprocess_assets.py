@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preprocess the scene 8-12 assets into Isaac-ready form (run with the eval .venv python).
+"""Preprocess the custom scene assets into Isaac-ready form (run with the eval .venv python).
 
 Two jobs, both needing the bundled Isaac build (pxr + the MJCF importer), so this launches a
 headless Isaac app once:
@@ -10,11 +10,12 @@ headless Isaac app once:
      (trimesh), rewrite the MJCF to reference the OBJs, then run Isaac Lab's ``MjcfConverter``
      (fix_base=True -> world-anchored) to emit an articulated USD under ``custom/cabinet/processed/``.
 
-  2. USDZ/USDA size measurement (scenes 8 + 10): the scanned Sketchfab assets (whiteboard, eraser,
-     e-stop buttons, and the articulated e-stop USDA) are authored ~2-4.7 "units" with
-     metersPerUnit=0.01 + upAxis=Y, but Isaac treats 1 unit = 1 m, so each spawns ~20-40x too big.
-     We measure each asset's true axis-aligned bbox (pxr BBoxCache) and print the ``scale`` that maps
-     its longest axis to a sensible tabletop target -- the values that go into the scene sidecars.
+  2. USDZ/USDA size measurement (scene 10 buttons): the scanned Sketchfab assets (the e-stop
+     buttons and the articulated e-stop USDA) are authored ~2-4.7 "units" with metersPerUnit=0.01 +
+     upAxis=Y, but Isaac treats 1 unit = 1 m, so each spawns ~20-40x too big. We measure each asset's
+     true axis-aligned bbox (pxr BBoxCache) and print the ``scale`` that maps its longest axis to a
+     sensible tabletop target -- the values that go into the scene sidecars. (The PolaRiS-ported
+     scene 8/9 meshes ship at known per-object scales, so they are NOT measured here.)
 
 Outputs a summary + ``assets/custom/processed_assets.json`` (per-asset extents + recommended scale).
 
@@ -41,8 +42,6 @@ MEASURE = {
     "estop_button_articulated": (CABINET_DIR.parent / "button" / "estop_articulated" / "estop_button.usda", 0.12),
     "Emergency_Stop_Button":    (CABINET_DIR.parent / "button" / "Emergency_Stop_Button.usdz", 0.12),
     "Button_Key_factory":       (CABINET_DIR.parent / "button" / "Button_Key__factory_8MB.usdz", 0.10),
-    "Whiteboard":               (CABINET_DIR.parent / "whiteboard" / "Whiteboard.usdz", 0.30),
-    "Whiteboard_Eraser":        (CABINET_DIR.parent / "whiteboard" / "Whiteboard_Eraser.usdz", 0.11),
 }
 
 

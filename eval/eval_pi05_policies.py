@@ -16,8 +16,9 @@ Two metrics per (policy, scene) are aggregated into ``runs/pi05-eval-v2/summary.
   * DENSE  -- mean over envs of the fraction of that scene's success criteria met (partial credit),
   * SPARSE -- fraction of envs meeting ALL criteria.
 
-Scenes: 6 toys->plate, 7 push cubes, 8 wipe whiteboard, 9 stack blocks, 10 push button,
-11 open cabinet, 12 blocks->plate. The base Pi-0.5 DROID policy is served straight from gs://.
+Scenes: 6 toys->plate, 8 PanClean (sponge->pan), 9 BlockStackKitchen (cubes->tray, stacked),
+10 push button, 11 open cabinet, 12 blocks->plate (scenes 8 & 9 ported from PolaRiS). The base
+Pi-0.5 DROID policy is served straight from gs://.
 
 Run with the eval venv python (cu128 torch), from the droid-sim-evals dir:
     .venv/bin/python eval/eval_pi05_policies.py                       # all policies, all scenes, 8 rollouts
@@ -57,7 +58,8 @@ from full_eval import _server_spec, start_server, wait_for_server, stop_server  
 from scene_specs import get_scene
 
 # scene id -> short output folder name (instructions come from scene_specs, the single source of truth).
-SCENE_TASKS = {6: "toys", 7: "cubes", 8: "whiteboard", 9: "stack", 10: "button", 11: "cabinet", 12: "blocks_plate"}
+# Scenes 8 & 9 are the PolaRiS-ported DROID-PanClean / DROID-BlockStackKitchen tasks (scene 7 removed).
+SCENE_TASKS = {6: "toys", 8: "pan_clean", 9: "block_stack", 10: "button", 11: "cabinet", 12: "blocks_plate"}
 
 # (output_name, hf_repo_or_None, serve_config, gs_checkpoint_or_None, control_mode)
 #   hf_repo None => served straight from the gs:// path (no download / no cache purge).
@@ -79,6 +81,10 @@ POLICIES = [
      "gs://openpi-assets/checkpoints/pi05_droid", "velocity"),
     ("pi05_droid_jointpos_polaris", None, "pi05_droid_jointpos_polaris",
      "gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris", "position"),
+    # Polaris (joint-position) full-DROID (streamed) + toys300 sim finetunes: plain / VAE / RND manifold-cost.
+    ("pi05polaris_droidfull_toys300_sim",     "SamratSahoo/pi05polaris_droidfull_toys300_sim",     "pi05polaris-droid+toys300sim-jointpos-stream",     None, "position"),
+    ("pi05polaris_droidfull_toys300_vae_sim", "SamratSahoo/pi05polaris_droidfull_toys300_vae_sim", "pi05polaris-droid+toys300vaesim-jointpos-stream", None, "position"),
+    ("pi05polaris_droidfull_toys300_rnd_sim", "SamratSahoo/pi05polaris_droidfull_toys300_rnd_sim", "pi05polaris-droid+toys300rndsim-jointpos-stream", None, "position"),
 ]
 
 DOWNLOAD_PATTERNS = ["params/**", "assets/**", "_CHECKPOINT_METADATA"]
@@ -173,25 +179,27 @@ def _fmt_summary(summary: dict, scenes: list) -> str:
         cells = []
         for s in scenes:
             r = per_scene.get(str(s)) or per_scene.get(s)
-            cells.append(f"{r['dense']:.2f}/{r['sparse']:.2f}" if r else "  --/-- ")
+            cells.append(f"{r.get('mean_points', r['dense']):.1f}/{r.get('max_points','?')} {r['sparse']:.2f}"
+                         if r else "  --/-- ")
         lines.append(f"{name:32s} | " + " | ".join(f"{c:>{w}s}" for c in cells))
-    lines.append("\n(cells are DENSE/SPARSE: dense=on-table-gated, sequence-credited mean of criteria; "
-                 "sparse=frac envs meeting ALL criteria)")
+    lines.append("\n(cells are MEAN_POINTS/MAX_POINTS SUCCESS_RATE: mean_points = avg # of whole-point "
+                 "boolean sub-goals met per rollout; success_rate = frac envs meeting ALL criteria)")
     return "\n".join(lines)
 
 
 def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=False,
-         max_steps=1800, seed=0, fallback_rollouts=None) -> None:
-    _OUT_ROOT.mkdir(parents=True, exist_ok=True)
+         max_steps=1800, seed=0, fallback_rollouts=None, out_root=None) -> None:
+    out_root = Path(out_root) if out_root is not None else _OUT_ROOT
+    out_root.mkdir(parents=True, exist_ok=True)
     scenes = sorted(scenes_filter) if scenes_filter else sorted(SCENE_TASKS)
     policies = POLICIES if not policies_filter else [p for p in POLICIES if p[0] in policies_filter]
 
-    log.info(f"output root: {_OUT_ROOT} | free disk: {_free_disk_gb():.0f} GB")
+    log.info(f"output root: {out_root} | free disk: {_free_disk_gb():.0f} GB")
     log.info(f"scenes: {scenes} ({', '.join(SCENE_TASKS[s] for s in scenes)})")
-    log.info(f"policies: {[p[0] for p in policies]} | rollouts/scene: {num_rollouts}")
+    log.info(f"policies: {[p[0] for p in policies]} | rollouts/scene: {num_rollouts} | record_video: {record_video}")
 
     summary: dict = {}
-    summary_path = _OUT_ROOT / "summary.json"
+    summary_path = out_root / "summary.json"
     if summary_path.exists():
         summary = json.loads(summary_path.read_text())
 
@@ -199,15 +207,16 @@ def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=
         log.info("#" * 72)
         log.info(f"### {name}  (config={config}, control_mode={control_mode})")
         # Resume: skip scenes whose results already exist; only run the missing ones.
-        todo = [s for s in scenes if not (_OUT_ROOT / name / SCENE_TASKS[s] / "results.json").exists()]
+        todo = [s for s in scenes if not (out_root / name / SCENE_TASKS[s] / "results.json").exists()]
         if not todo:
             log.info(f"[{name}] all selected scenes already scored; loading + skipping")
             summary.setdefault(name, {})
             for s in scenes:
-                rp = _OUT_ROOT / name / SCENE_TASKS[s] / "results.json"
+                rp = out_root / name / SCENE_TASKS[s] / "results.json"
                 if rp.exists():
                     r = json.loads(rp.read_text())
-                    summary[name][str(s)] = {"dense": r["dense_score"], "sparse": r["sparse_score"]}
+                    summary[name][str(s)] = {"dense": r["dense_score"], "sparse": r["sparse_score"],
+                                             "mean_points": r.get("mean_points"), "max_points": r.get("max_points")}
             if repo is not None:
                 shutil.rmtree(_CKPT_ROOT / name, ignore_errors=True)
             continue
@@ -226,7 +235,7 @@ def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=
 
             summary.setdefault(name, {})
             for s in todo:
-                out_dir = _OUT_ROOT / name / SCENE_TASKS[s]
+                out_dir = out_root / name / SCENE_TASKS[s]
                 res = _run_worker(s, control_mode, out_dir, num_rollouts, record_video, max_steps, seed)
                 if not res and fallback_rollouts and fallback_rollouts < num_rollouts:
                     # A crashed worker (e.g. VRAM OOM on scene load) leaves no results.json; retry smaller.
@@ -234,7 +243,8 @@ def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=
                                 f"retrying at {fallback_rollouts} rollouts")
                     res = _run_worker(s, control_mode, out_dir, fallback_rollouts, record_video, max_steps, seed)
                 if res:
-                    summary[name][str(s)] = {"dense": res["dense_score"], "sparse": res["sparse_score"]}
+                    summary[name][str(s)] = {"dense": res["dense_score"], "sparse": res["sparse_score"],
+                                             "mean_points": res.get("mean_points"), "max_points": res.get("max_points")}
                     log.info(f"  [{name}/{SCENE_TASKS[s]}] dense={res['dense_score']:.3f} "
                              f"sparse={res['sparse_score']:.3f} rates={res['criterion_rates']}")
                 summary_path.write_text(json.dumps(summary, indent=2))  # checkpoint after each scene
@@ -251,9 +261,9 @@ def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=
 
     summary_path.write_text(json.dumps(summary, indent=2))
     table = _fmt_summary(summary, scenes)
-    (_OUT_ROOT / "summary.txt").write_text(table)
+    (out_root / "summary.txt").write_text(table)
     log.info("=" * 72)
-    log.info(f"DONE. Results under {_OUT_ROOT}\n\n{table}\n")
+    log.info(f"DONE. Results under {out_root}\n\n{table}\n")
 
 
 def _parse_args():
@@ -268,6 +278,9 @@ def _parse_args():
     ap.add_argument("--record-video", action="store_true", help="write a tiled multi-env video.mp4 per scene (default off)")
     ap.add_argument("--max-steps", type=int, default=1800, help="env steps per rollout")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out-root", type=str, default=None,
+                    help="output root dir (default runs/pi05-eval-v2). Use a separate dir for e.g. video "
+                         "capture so it doesn't collide with / get skipped by the scored eval's results.")
     args = ap.parse_args()
     if args.policies:
         known = {p[0] for p in POLICIES}
@@ -285,4 +298,4 @@ if __name__ == "__main__":
     a = _parse_args()
     sys.exit(main(policies_filter=a.policies, scenes_filter=a.scenes, num_rollouts=a.num_rollouts,
                   record_video=a.record_video, max_steps=a.max_steps, seed=a.seed,
-                  fallback_rollouts=a.rollout_fallback))
+                  fallback_rollouts=a.rollout_fallback, out_root=a.out_root))

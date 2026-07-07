@@ -43,6 +43,38 @@ FPS = 15
 # --------------------------------------------------------------------------- #
 # Object state read / randomized-pose write (Isaac Lab RigidObject/Articulation)#
 # --------------------------------------------------------------------------- #
+_FINGERTIP_BODY_IDX = None   # cache: (left_idx, right_idx) into robot.data.body_names
+
+
+def _fingertip_body_indices(robot):
+    """Resolve the (left, right) Robotiq fingertip body indices once; their world midpoint is the TCP.
+
+    The end-effector reach criterion (PolaRiS-ported scenes 8-9) must key off the actual grasp point,
+    so we use the midpoint of the two inner-finger contact PADs (closest to the grasp point), falling
+    back to the inner-finger links, then any left/right finger body. Cached across steps. Raises a clear
+    error listing the available bodies if it cannot find one of each side.
+    """
+    global _FINGERTIP_BODY_IDX
+    if _FINGERTIP_BODY_IDX is not None:
+        return _FINGERTIP_BODY_IDX
+    names = list(robot.data.body_names)
+
+    def pick(side: str) -> int:
+        for pat in (f"{side}_inner_finger_pad", f"{side}_inner_finger"):
+            if pat in names:
+                return names.index(pat)
+        cands = [i for i, nm in enumerate(names) if nm.lower().startswith(side) and "finger" in nm.lower()]
+        if cands:
+            return cands[-1]          # deepest matching link ~ closest to the fingertip
+        raise RuntimeError(f"[reach] could not find a '{side}' fingertip body among {names}")
+
+    li, ri = pick("left"), pick("right")
+    logger.info(f"[reach] TCP = midpoint of bodies '{names[li]}' + '{names[ri]}' "
+                f"(indices {li},{ri} of {len(names)} bodies)")
+    _FINGERTIP_BODY_IDX = (li, ri)
+    return _FINGERTIP_BODY_IDX
+
+
 def read_states(env, rigid_names, art_names) -> list:
     """Per-env [{name: {"pos": np(3), "quat": np(4 wxyz), ["joint": np(J)]}}] in WORLD frame.
 
@@ -57,11 +89,28 @@ def read_states(env, rigid_names, art_names) -> list:
         pos = obj.data.root_pos_w.detach().cpu().numpy().astype(np.float64)
         quat = obj.data.root_quat_w.detach().cpu().numpy().astype(np.float64)
         joints = obj.data.joint_pos.detach().cpu().numpy().astype(np.float64) if name in art_names else None
+        jnames = list(obj.data.joint_names) if name in art_names else None   # for DOF-by-name in eval_articulation
         for i in range(n):
             d = {"pos": pos[i], "quat": quat[i]}
             if joints is not None:
                 d["joint"] = joints[i]
+                d["joint_names"] = jnames
             out[i][name] = d
+
+    # End-effector = the Robotiq fingertip MIDPOINT (a true TCP / grasp point, matching PolaRiS's
+    # `ee_frame` target) + normalized gripper opening (0 open .. 1 closed). Stored under reserved keys
+    # for the PolaRiS-ported reach / release criteria (scenes 8-9). Object-only evaluators (6, 10-12)
+    # ignore them; measure_base()/sample_layout() skip them. NB: the wrist CAMERA (mounted on the gripper
+    # base link) was a poor EE proxy -- ~0.13-0.18 m behind the grasp point -- so reach almost never fired.
+    robot = scene["robot"]
+    li, ri = _fingertip_body_indices(robot)
+    bp = robot.data.body_pos_w.detach().cpu().numpy().astype(np.float64)          # (n, n_bodies, 3)
+    ee = 0.5 * (bp[:, li, :] + bp[:, ri, :])                                      # (n, 3) TCP midpoint
+    fj = list(robot.data.joint_names).index("finger_joint")
+    grip = (robot.data.joint_pos[:, fj] / (np.pi / 4.0)).detach().cpu().numpy().astype(np.float64)   # (n,)
+    for i in range(n):
+        out[i]["_ee"] = {"pos": ee[i]}
+        out[i]["_gripper"] = {"val": float(grip[i])}
     return out
 
 
@@ -93,7 +142,9 @@ def measure_base(env, rigid_names, art_names, env_origins) -> dict:
     """Env-0 settled pose per object, in env-LOCAL frame -- the sampler's baseline (z + orientation)."""
     world0 = read_states(env, rigid_names, art_names)[0]
     o0 = env_origins[0].detach().cpu().numpy()
-    return {k: {"pos": world0[k]["pos"] - o0, "quat": world0[k]["quat"]} for k in world0}
+    # Only the real rigid/articulated objects (skip the reserved "_ee"/"_gripper" state entries).
+    return {k: {"pos": world0[k]["pos"] - o0, "quat": world0[k]["quat"]}
+            for k in list(rigid_names) + list(art_names)}
 
 
 # --------------------------------------------------------------------------- #
@@ -312,25 +363,58 @@ def main() -> int:
         obs = settle_sim(env, obs, steps=args.post_settle_steps, reset_episode_buf=False)
         final = read_states(env, rigid, art)
 
-        # --- score every env (on-table gates are multiplicative; ordered criteria credited in sequence) ---
-        from scene_specs import resolve_gates, score_env
+        # --- score every env: each criterion is an independent boolean worth one whole point (no gate/partial) ---
+        from scene_specs import score_env
 
         per_env = [spec.evaluate(init[i], final[i], traj[i], spec) for i in range(n)]
         criteria = list(per_env[0].keys())
         scored = [score_env(e, spec) for e in per_env]
-        dense = float(np.mean([s["dense"] for s in scored]))
-        sparse = float(np.mean([s["sparse"] for s in scored]))
-        raw_rates = {c: float(np.mean([e[c] for e in per_env])) for c in criteria}          # did it physically happen
-        credited_rates = {c: float(np.mean([s["credited"][c] for s in scored])) for c in criteria}  # counted after ordering
+        per_env_points = [int(s["points"]) for s in scored]                                 # whole-number score per env
+        max_points = int(scored[0]["max_points"])
+        mean_points = float(np.mean(per_env_points))
+        success_rate = float(np.mean([s["success"] for s in scored]))                       # frac envs meeting ALL
+        dense = mean_points / max_points if max_points else 0.0                             # normalized completion [0,1]
+        sparse = success_rate
+        raw_rates = {c: float(np.mean([e[c] for e in per_env])) for c in criteria}          # per-criterion pass rate
+        # Diagnostic (NOT counted): frac envs that ended with any tracked object dropped below the table.
+        floor_drops = 0
+        for i in range(n):
+            if any((float(final[i][nm]["pos"][2]) - float(init[i][nm]["pos"][2])) < -spec.geom.floor_drop
+                   for nm in rigid):
+                floor_drops += 1
+        floor_drop_rate = float(floor_drops) / n if n else 0.0
+
+        # Diagnostic: per-env MIN distance from the TCP (_ee, fingertip midpoint) to each rigid object over
+        # the whole episode. `reached(obj)` == (min_tcp_dist[obj] < reach_thresh), so saving this makes the
+        # PolaRiS reach criterion recomputable at ANY threshold offline -- no re-sim to calibrate/tune it.
+        min_tcp_dist = []
+        for i in range(n):
+            seq_i = traj[i] + [final[i]]
+            min_tcp_dist.append({
+                name: float(min(np.linalg.norm(np.asarray(s["_ee"]["pos"], float) - np.asarray(s[name]["pos"], float))
+                                for s in seq_i))
+                for name in rigid
+            })
+        _dist_summary = {name: {
+            "min": float(np.min([d[name] for d in min_tcp_dist])),
+            "median": float(np.median([d[name] for d in min_tcp_dist])),
+            "mean": float(np.mean([d[name] for d in min_tcp_dist])),
+        } for name in rigid}
+
         results = {
             "scene": args.scene, "instruction": spec.instruction, "num_envs": n,
-            "criteria": criteria, "gates": resolve_gates(spec, criteria), "sequence": spec.sequence,
-            "per_env": per_env,
-            "dense_score": dense, "sparse_score": sparse,
-            "criterion_rates": raw_rates, "credited_rates": credited_rates,
+            "criteria": criteria,
+            "per_env": per_env, "per_env_points": per_env_points,
+            "max_points": max_points, "mean_points": mean_points, "success_rate": success_rate,
+            "dense_score": dense, "sparse_score": sparse,          # dense = mean_points/max_points, sparse = success_rate
+            "criterion_rates": raw_rates, "floor_drop_rate": floor_drop_rate,
+            "min_tcp_dist": min_tcp_dist, "reach_thresh": float(spec.geom.reach_thresh),
         }
-        logger.info(f"scene {args.scene}: dense={dense:.3f} sparse={sparse:.3f} "
-                    f"raw={raw_rates} credited={credited_rates}")
+        logger.info(f"scene {args.scene}: min TCP->object dist (m) per-object [min/median/mean]: "
+                    + "  ".join(f"{k}={v['min']:.3f}/{v['median']:.3f}/{v['mean']:.3f}" for k, v in _dist_summary.items()))
+        logger.info(f"scene {args.scene}: mean_points={mean_points:.2f}/{max_points} "
+                    f"(dense={dense:.3f}) success_rate={sparse:.3f} floor_drop_rate={floor_drop_rate:.3f} "
+                    f"rates={raw_rates}")
 
     (out_dir / "results.json").write_text(json.dumps(results, indent=2))
     logger.info(f"wrote {out_dir / 'results.json'}")

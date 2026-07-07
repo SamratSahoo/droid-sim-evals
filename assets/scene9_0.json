@@ -1,35 +1,56 @@
 {
-  "_comment": "Scene 9 (stack the blocks). Three 5cm colored rigid cuboids (kind:box, MeshCuboidCfg) resting separated on the table, same physics knobs as scene7's push cubes. Base scene9_0.usd = empty table+dome+robot. Table-top surface ~z=0.045; a 0.05 cube centered at z=0.075 settles onto the table. Randomized XY + yaw per env (see eval/scene_specs.py).",
+  "_comment": "Scene 9 = DROID-BlockStackKitchen (ported from PolaRiS owhan/PolaRiS-Hub `block_stack_kitchen`). Task: 'Place and stack the blocks on top of the green tray' -- pick up both cubes, place them in the green tray, and stack the green cube on the wooden cube. Objects are PolaRiS's scanned USDZ meshes (custom/block_stack_kitchen/) spawned via kind:'usd_rigid'. The green tray is the fixed TARGET (kinematic, stable) at a lightly-randomized pose; the two ~6cm cubes are the pick+stack objects (randomized off the tray, see eval/scene_specs.py::SCENES[9]). PolaRiS per-object scales are kept (USDZ meshes in arbitrary units). All meshes are XY-centered, base at local z=0, so pos.z = table-top rest height (~0.045-0.05). Base scene9_0.usd = empty table+dome+robot. NOTE: first-cut layout for our smaller workspace (x~[0.30,0.60], y~[-0.12,0.24]); verify cube graspability + tray reach in a smoke render and nudge poses if needed. Distractors (tomato, corn) are a curated subset of PolaRiS's kitchen clutter (full library in custom/block_stack_kitchen/).",
   "objects": [
     {
-      "name": "block_a",
-      "kind": "box",
-      "size": [0.05, 0.05, 0.05],
-      "pos": [0.42, 0.15, 0.075],
+      "name": "tray",
+      "kind": "usd_rigid",
+      "usd": "custom/block_stack_kitchen/green_tray.usdz",
+      "scale": 0.22,
+      "pos": [0.50, 0.10, 0.05],
       "rot": [1.0, 0.0, 0.0, 0.0],
-      "color": [0.85, 0.1, 0.1],
-      "mass": 0.05,
-      "rigid": {"static_friction": 0.7, "dynamic_friction": 0.6}
+      "kinematic": true,
+      "mass": 2.0,
+      "collision": "convexHull"
     },
     {
-      "name": "block_b",
-      "kind": "box",
-      "size": [0.05, 0.05, 0.05],
-      "pos": [0.45, 0.0, 0.075],
+      "name": "green_cube",
+      "kind": "usd_rigid",
+      "usd": "custom/block_stack_kitchen/green_cube.usdz",
+      "scale": 0.06,
+      "pos": [0.34, -0.06, 0.055],
       "rot": [1.0, 0.0, 0.0, 0.0],
-      "color": [0.1, 0.7, 0.2],
       "mass": 0.05,
-      "rigid": {"static_friction": 0.7, "dynamic_friction": 0.6}
+      "collision": "convexHull"
     },
     {
-      "name": "block_c",
-      "kind": "box",
-      "size": [0.05, 0.05, 0.05],
-      "pos": [0.52, 0.18, 0.075],
+      "name": "wood_cube",
+      "kind": "usd_rigid",
+      "usd": "custom/block_stack_kitchen/wood_cube.usdz",
+      "scale": 0.06,
+      "pos": [0.36, 0.06, 0.055],
       "rot": [1.0, 0.0, 0.0, 0.0],
-      "color": [0.15, 0.35, 0.9],
       "mass": 0.05,
-      "rigid": {"static_friction": 0.7, "dynamic_friction": 0.6}
+      "collision": "convexHull"
+    },
+    {
+      "name": "tomato",
+      "kind": "usd_rigid",
+      "usd": "custom/block_stack_kitchen/tomato.usdz",
+      "scale": 0.06,
+      "pos": [0.55, -0.10, 0.055],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "mass": 0.1,
+      "collision": "convexHull"
+    },
+    {
+      "name": "corn",
+      "kind": "usd_rigid",
+      "usd": "custom/block_stack_kitchen/uw_corn.usdz",
+      "scale": 0.08,
+      "pos": [0.34, 0.22, 0.055],
+      "rot": [1.0, 0.0, 0.0, 0.0],
+      "mass": 0.1,
+      "collision": "convexHull"
     }
   ]
 }
