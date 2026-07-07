@@ -42,13 +42,21 @@ export PATH="$HOME/.pixi/bin:$PATH"
 # ---- config (cfg/<name>.yml defaults, overlaid by the optional $1 user YAML) -----------------
 # The loader emits `export UPPER_KEY=...` for each scalar and, if tamp_overrides is non-empty,
 # writes them to a JSON sidecar and exports TAMP_OVERRIDES_JSON (passed to each tiptop server).
-CFG_DEFAULT="$DSE_DIR/cfg/datagen_8gpu_neuronic.yml"
+CFG_DEFAULT="$DSE_DIR/cfg/datagen.yml"
 CFG_USER="${1:-}"
 LOADER_PY="$DSE_DIR/.venv/bin/python"    # dse venv has pyyaml; on the project FS (mounted on nodes)
+LOADER_SCRIPT="$DSE_DIR/slurm/lib/load_config.py"
 OVERRIDES_JSON="$DSE_DIR/runs/tamp_overrides_${SLURM_JOB_ID:-manual}.json"
-eval "$("$LOADER_PY" "$DSE_DIR/slurm/lib/load_config.py" \
+# Fail LOUDLY if the loader or default config is missing / the loader errors. A silent fallback here
+# previously ran three "override" jobs with STOCK tamp params (slurm/lib was gitignored AND this
+# CFG_DEFAULT pointed at a stale filename), so guard the whole chain instead of eval-ing an empty string.
+[ -f "$LOADER_SCRIPT" ] || { echo "FATAL: config loader missing: $LOADER_SCRIPT (is slurm/lib/ gitignored/absent?)" >&2; exit 1; }
+[ -f "$CFG_DEFAULT" ]   || { echo "FATAL: default config missing: $CFG_DEFAULT" >&2; exit 1; }
+CONFIG_EXPORTS="$("$LOADER_PY" "$LOADER_SCRIPT" \
         --default "$CFG_DEFAULT" ${CFG_USER:+--config "$CFG_USER"} \
-        --overrides-out "$OVERRIDES_JSON")"
+        --overrides-out "$OVERRIDES_JSON")" \
+  || { echo "FATAL: config loader failed for default=$CFG_DEFAULT config=${CFG_USER:-<none>} (see stderr)" >&2; exit 1; }
+eval "$CONFIG_EXPORTS"
 
 # Fallbacks so the script still runs if a key is absent from the merged config.
 TOTAL_EPISODES="${TOTAL_EPISODES:-300}"
