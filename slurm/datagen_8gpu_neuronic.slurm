@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:l40:8
 #SBATCH --cpus-per-task=104
 #SBATCH --mem=490G
-#SBATCH --time=12:00:00
+#SBATCH --time=36:00:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 #
@@ -62,7 +62,7 @@ eval "$CONFIG_EXPORTS"
 TOTAL_EPISODES="${TOTAL_EPISODES:-300}"
 NUM_GPUS="${NUM_GPUS:-8}"
 NUM_ENVS="${NUM_ENVS:-128}"
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-2000}"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-4000}"
 SCENE="${SCENE:-6}"
 VARIANT="${VARIANT:-0}"
 M2T2_PORT="${M2T2_PORT:-8123}"           # must be 8123: tiptop's m2t2.url is hardcoded to localhost:8123
@@ -81,6 +81,55 @@ if [ -n "${TAMP_OVERRIDES_JSON:-}" ] && [ -s "${TAMP_OVERRIDES_JSON}" ]; then
   cp "$TAMP_OVERRIDES_JSON" "$LOG_DIR/tamp_overrides.json" 2>/dev/null || true
   echo "=== TAMP overrides: $(tr -d '\n ' < "$TAMP_OVERRIDES_JSON") ==="
 fi
+
+# Build the tiptop cuRobo MotionGen with CUDA graphs (fast plan_single replay -> cuts the dominant
+# per-plan refinement time). Safe here because the sim scene-6 world is bounded (the server pre-sizes
+# the collision cache to obb=48/mesh=24). DEFAULT ON as of the on-node A/B (jobs 3497951 off / 3497952
+# on): 6.6x faster cuRobo refinement, 2.74x faster planning, 1.81x faster whole job, with success-rate
+# PARITY (99.2% both) and ZERO cache overflows across ~256 real scene-6 plans. Disable with
+# `USE_CUDA_GRAPH=0 sbatch ...` or `use_cuda_graph: false` in the cfg (falls back to legacy re-trace).
+case "${USE_CUDA_GRAPH:-1}" in
+  0 | false | no | off | False)
+    TIPTOP_CG_ARG=""
+    echo "=== CUDA graphs DISABLED (USE_CUDA_GRAPH=${USE_CUDA_GRAPH:-1}) — legacy plan_single re-trace ===" ;;
+  *)
+    TIPTOP_CG_ARG="--use-cuda-graph"
+    echo "=== CUDA graphs ENABLED by default for tiptop MotionGen (disable with USE_CUDA_GRAPH=0) ===" ;;
+esac
+
+# Phase-2 server-side BATCHED planning (opt-in): the tiptop server groups concurrent post-perception
+# requests and solves them together via run_cutamp_batched (one batched particle-opt + refinement)
+# instead of one plan at a time. OPT-IN with `USE_BATCH_PLAN=1 sbatch ...`; size with BATCH_PLAN_SIZE
+# (default 16). Raises the tiptop server's max_concurrent_perception to the batch size so enough
+# scenes are perceived+queued to fill a batch. (Bypasses the CG single-plan path; batch mode builds
+# its own CG-off batched solver.)
+TIPTOP_BATCH_ENV=""
+TIPTOP_BATCH_ARG=""
+if [ "${USE_BATCH_PLAN:-0}" = "1" ] || [ "${USE_BATCH_PLAN:-false}" = "true" ]; then
+  BATCH_PLAN_SIZE="${BATCH_PLAN_SIZE:-16}"
+  TIPTOP_BATCH_ENV="TIPTOP_BATCH_PLAN=1 TIPTOP_BATCH_SIZE=$BATCH_PLAN_SIZE TIPTOP_BATCH_WINDOW_S=${BATCH_PLAN_WINDOW_S:-4.0}"
+  # Debug: forward CUTAMP_BATCH_CAPTURE to the tiptop server so run_cutamp_batched dumps the first real
+  # batch's inputs to disk for fast offline replay.
+  [ -n "${CUTAMP_BATCH_CAPTURE:-}" ] && TIPTOP_BATCH_ENV="$TIPTOP_BATCH_ENV CUTAMP_BATCH_CAPTURE=$CUTAMP_BATCH_CAPTURE"
+  # Debug: forward CUDA_LAUNCH_BLOCKING (pinpoints the exact kernel of an async illegal-memory-access) and
+  # CUTAMP_CANONICALIZE (default on) to the tiptop server.
+  [ -n "${CUDA_LAUNCH_BLOCKING:-}" ] && TIPTOP_BATCH_ENV="$TIPTOP_BATCH_ENV CUDA_LAUNCH_BLOCKING=$CUDA_LAUNCH_BLOCKING"
+  [ -n "${CUTAMP_CANONICALIZE:-}" ] && TIPTOP_BATCH_ENV="$TIPTOP_BATCH_ENV CUTAMP_CANONICALIZE=$CUTAMP_CANONICALIZE"
+  # CUTAMP_BATCH_PAD: fixed env count refine groups are padded to so the batched-solver cache hits
+  # across batches (default 8 in cutamp; =1 restores exact-count batches for A/B).
+  [ -n "${CUTAMP_BATCH_PAD:-}" ] && TIPTOP_BATCH_ENV="$TIPTOP_BATCH_ENV CUTAMP_BATCH_PAD=$CUTAMP_BATCH_PAD"
+  # Single-group canonicalization v2 knobs (defaults live in cutamp: surface='plate', count=3;
+  # set ='' / =0 to disable an axis for A/B).
+  [ -n "${CUTAMP_CANON_SURFACE+x}" ] && TIPTOP_BATCH_ENV="$TIPTOP_BATCH_ENV CUTAMP_CANON_SURFACE=$CUTAMP_CANON_SURFACE"
+  [ -n "${CUTAMP_CANON_COUNT:-}" ] && TIPTOP_BATCH_ENV="$TIPTOP_BATCH_ENV CUTAMP_CANON_COUNT=$CUTAMP_CANON_COUNT"
+  [ -n "${CUTAMP_REFINE_RANKS:-}" ] && TIPTOP_BATCH_ENV="$TIPTOP_BATCH_ENV CUTAMP_REFINE_RANKS=$CUTAMP_REFINE_RANKS"
+  # CUTAMP_MG_CACHE: LRU size for cached batched solvers. Single-group runs have ~1-2 signatures, and
+  # a B=16 solver with the enlarged attach budget is multi-GiB -- keep this small on shared GPUs.
+  [ -n "${CUTAMP_MG_CACHE:-}" ] && TIPTOP_BATCH_ENV="$TIPTOP_BATCH_ENV CUTAMP_MG_CACHE=$CUTAMP_MG_CACHE"
+  TIPTOP_BATCH_ARG="--max-concurrent-perception $BATCH_PLAN_SIZE"
+  echo "=== server-side BATCHED planning ENABLED (batch_size=$BATCH_PLAN_SIZE) ==="
+fi
+
 export OMNI_KIT_ACCEPT_EULA=YES     # Isaac Sim EULA (headless: no TTY to answer the prompt)
 : "${GEMINI_API_KEY:?GEMINI_API_KEY not set (tiptop perception needs it; it is in ~/.bashrc)}"
 # Thread discipline: up to ~16 CPU-heavy procs (8 tiptop + 8 workers) share this 104-core node.
@@ -149,7 +198,7 @@ done
 for ((i = 0; i < NUM_GPUS; i++)); do
   port=$((TIPTOP_PORT_BASE + i))
   echo "=== launching tiptop server $i on GPU$i :$port (M2T2 :$((M2T2_PORT + i)), staggered) ==="
-  setsid bash -c "cd '$TIPTOP_DIR' && exec env CUDA_VISIBLE_DEVICES=$i TIPTOP_M2T2_PORT=$((M2T2_PORT + i)) pixi run python -m tiptop.tiptop_websocket_server --port $port $TIPTOP_OVERRIDE_ARG" \
+  setsid bash -c "cd '$TIPTOP_DIR' && exec env CUDA_VISIBLE_DEVICES=$i TIPTOP_M2T2_PORT=$((M2T2_PORT + i)) $TIPTOP_BATCH_ENV pixi run python -m tiptop.tiptop_websocket_server --port $port $TIPTOP_OVERRIDE_ARG $TIPTOP_CG_ARG $TIPTOP_BATCH_ARG" \
     > "$LOG_DIR/tiptop_$i.log" 2>&1 &
   SERVER_PIDS+=("$!")
   wait_tcp 127.0.0.1 "$port" "$SERVER_TIMEOUT" "tiptop_$i" || { echo "tiptop_$i failed; see $LOG_DIR/tiptop_$i.log"; tail -20 "$LOG_DIR/tiptop_$i.log"; exit 1; }
