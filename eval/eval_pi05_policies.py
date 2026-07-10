@@ -81,10 +81,12 @@ POLICIES = [
      "gs://openpi-assets/checkpoints/pi05_droid", "velocity"),
     ("pi05_droid_jointpos_polaris", None, "pi05_droid_jointpos_polaris",
      "gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris", "position"),
-    # Polaris (joint-position) full-DROID (streamed) + toys300 sim finetunes: plain / VAE / RND manifold-cost.
+    # Polaris (joint-position) full-DROID (streamed) + toys sim finetunes: toys100 / toys300 plain / VAE / RND / VAE+RND manifold-cost.
+    ("pi05polaris_droidfull_toys100_sim",     "SamratSahoo/pi05polaris_droidfull_toys100_sim",     "pi05polaris-droid+toys100sim-jointpos-stream",     None, "position"),
     ("pi05polaris_droidfull_toys300_sim",     "SamratSahoo/pi05polaris_droidfull_toys300_sim",     "pi05polaris-droid+toys300sim-jointpos-stream",     None, "position"),
     ("pi05polaris_droidfull_toys300_vae_sim", "SamratSahoo/pi05polaris_droidfull_toys300_vae_sim", "pi05polaris-droid+toys300vaesim-jointpos-stream", None, "position"),
     ("pi05polaris_droidfull_toys300_rnd_sim", "SamratSahoo/pi05polaris_droidfull_toys300_rnd_sim", "pi05polaris-droid+toys300rndsim-jointpos-stream", None, "position"),
+    ("pi05polaris_droidfull_toys300_vaernd_sim", "SamratSahoo/pi05polaris_droidfull_toys300_vaernd_sim", "pi05polaris-droid+toys300vaerndsim-jointpos-stream", None, "position"),
 ]
 
 DOWNLOAD_PATTERNS = ["params/**", "assets/**", "_CHECKPOINT_METADATA"]
@@ -120,8 +122,13 @@ def _download(repo: str, dest: Path) -> None:
     log.info(f"downloaded {size_gb:.1f} GB in {time.time() - t0:.0f}s")
 
 
-def _launch_server(config: str, checkpoint: str) -> "subprocess.Popen":
-    """Launch the openpi pi-0.5 server for a checkpoint and wait until it accepts connections."""
+def _launch_server(config: str, checkpoint: str, xla_mem_fraction: float = 0.5) -> "subprocess.Popen":
+    """Launch the openpi pi-0.5 server for a checkpoint and wait until it accepts connections.
+
+    ``xla_mem_fraction`` is the share of the GPU the JAX policy server preallocates; the rest is left
+    to the Isaac worker. The 0.5 default suits ~8 parallel envs -- large ``--num-rollouts`` (e.g. 64)
+    need a smaller fraction so the worker can fit its scene replicas + per-env camera render targets.
+    """
     spec = _server_spec(
         "pi05",
         openpi_dir=str(_REPO_ROOT / "openpi"),
@@ -133,7 +140,7 @@ def _launch_server(config: str, checkpoint: str) -> "subprocess.Popen":
         tiptop_host="localhost",
         tiptop_port=8765,
         tiptop_server_module="tiptop.tiptop_websocket_server",
-        xla_mem_fraction=0.5,                           # share the GPU with the Isaac worker
+        xla_mem_fraction=xla_mem_fraction,              # share the GPU with the Isaac worker
     )
     proc = start_server("pi05", spec)
     if not wait_for_server(proc, "localhost", _PI05_PORT, timeout=1800):
@@ -188,7 +195,7 @@ def _fmt_summary(summary: dict, scenes: list) -> str:
 
 
 def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=False,
-         max_steps=1800, seed=0, fallback_rollouts=None, out_root=None) -> None:
+         max_steps=1800, seed=0, fallback_rollouts=None, out_root=None, xla_mem_fraction=0.5) -> None:
     out_root = Path(out_root) if out_root is not None else _OUT_ROOT
     out_root.mkdir(parents=True, exist_ok=True)
     scenes = sorted(scenes_filter) if scenes_filter else sorted(SCENE_TASKS)
@@ -231,7 +238,7 @@ def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=
                 _download(repo, ckpt_dir)
                 checkpoint = str(ckpt_dir)
                 log.info(f"free disk after download: {_free_disk_gb():.0f} GB")
-            server = _launch_server(config, checkpoint)
+            server = _launch_server(config, checkpoint, xla_mem_fraction)
 
             summary.setdefault(name, {})
             for s in todo:
@@ -281,6 +288,9 @@ def _parse_args():
     ap.add_argument("--out-root", type=str, default=None,
                     help="output root dir (default runs/pi05-eval-v2). Use a separate dir for e.g. video "
                          "capture so it doesn't collide with / get skipped by the scored eval's results.")
+    ap.add_argument("--xla-mem-fraction", type=float, default=0.5,
+                    help="share of the GPU preallocated by the JAX policy server; the rest is left to the "
+                         "Isaac worker. Lower it (e.g. 0.3) for large --num-rollouts (default 0.5)")
     args = ap.parse_args()
     if args.policies:
         known = {p[0] for p in POLICIES}
@@ -298,4 +308,5 @@ if __name__ == "__main__":
     a = _parse_args()
     sys.exit(main(policies_filter=a.policies, scenes_filter=a.scenes, num_rollouts=a.num_rollouts,
                   record_video=a.record_video, max_steps=a.max_steps, seed=a.seed,
-                  fallback_rollouts=a.rollout_fallback, out_root=a.out_root))
+                  fallback_rollouts=a.rollout_fallback, out_root=a.out_root,
+                  xla_mem_fraction=a.xla_mem_fraction))
