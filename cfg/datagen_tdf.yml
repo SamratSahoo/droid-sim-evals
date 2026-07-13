@@ -37,7 +37,7 @@ worker_stagger: 15            # seconds between worker starts (avoid Isaac-Kit i
 #
 # Leave the mapping EMPTY (the default below) for stock behavior identical to prior runs.
 tamp_overrides:
-  time_dilation_factor_literal: 0.5
+  time_dilation_factor_literal: 0.4
 #
 # Example -- the RND-novelty regime from the sweep (maximize novelty against a DROID-style pull):
 # tamp_overrides:

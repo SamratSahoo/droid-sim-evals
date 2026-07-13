@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:l40:8
 #SBATCH --cpus-per-task=104
 #SBATCH --mem=490G
-#SBATCH --time=36:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 #
@@ -63,6 +63,11 @@ TOTAL_EPISODES="${TOTAL_EPISODES:-300}"
 NUM_GPUS="${NUM_GPUS:-8}"
 NUM_ENVS="${NUM_ENVS:-128}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-4000}"
+# Per-episode replay step cap. Defaults to tamp_data_gen's own 2400 when unset. Raise it for
+# heavily time-dilated runs (small time_dilation_factor -> ~1/tdf longer episodes) so the longer
+# trajectories don't truncate before plan_done (e.g. tdf=0.2 ~= 5x -> set MAX_STEPS_PER_EPISODE=5000).
+WORKER_MAXSTEPS_ARG=""
+[ -n "${MAX_STEPS_PER_EPISODE:-}" ] && WORKER_MAXSTEPS_ARG="--max-steps-per-episode $MAX_STEPS_PER_EPISODE"
 SCENE="${SCENE:-6}"
 VARIANT="${VARIANT:-0}"
 M2T2_PORT="${M2T2_PORT:-8123}"           # must be 8123: tiptop's m2t2.url is hardcoded to localhost:8123
@@ -231,7 +236,7 @@ for ((i = 0; i < NUM_GPUS; i++)); do
         --scene "$SCENE" --variant "$VARIANT" \
         --tiptop-host 127.0.0.1 --tiptop-port "$port" --num-tiptop-servers 1 \
         --num-envs "$NUM_ENVS" --num-episodes "$n" --max-attempts "$MAX_ATTEMPTS" \
-        --seed $((i * 100000)) --out-dir "$out" \
+        --seed $((i * 100000)) --out-dir "$out" $WORKER_MAXSTEPS_ARG \
     > "$LOG_DIR/worker_$i.log" 2>&1 &
   WORKER_PIDS[$i]=$!
   sleep "$WORKER_STAGGER"
