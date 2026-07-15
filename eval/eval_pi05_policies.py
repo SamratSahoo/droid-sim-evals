@@ -87,6 +87,9 @@ POLICIES = [
     ("pi05polaris_droidfull_toys300_vae_sim", "SamratSahoo/pi05polaris_droidfull_toys300_vae_sim", "pi05polaris-droid+toys300vaesim-jointpos-stream", None, "position"),
     ("pi05polaris_droidfull_toys300_rnd_sim", "SamratSahoo/pi05polaris_droidfull_toys300_rnd_sim", "pi05polaris-droid+toys300rndsim-jointpos-stream", None, "position"),
     ("pi05polaris_droidfull_toys300_vaernd_sim", "SamratSahoo/pi05polaris_droidfull_toys300_vaernd_sim", "pi05polaris-droid+toys300vaerndsim-jointpos-stream", None, "position"),
+    # TDF-cost and VAE(35k)+TDF-cost polaris (joint-position) full-DROID (streamed) + toys300 sim finetunes.
+    ("pi05polaris_droidfull_toys300_tdf_sim",      "SamratSahoo/pi05polaris_droidfull_toys300_tdf_sim",      "pi05polaris-droid+toys300tdfsim-jointpos-stream",      None, "position"),
+    ("pi05polaris_droidfull_toys300_vae35ktdf_sim", "SamratSahoo/pi05polaris_droidfull_toys300_vae35ktdf_sim", "pi05polaris-droid+toys300vae35ktdfsim-jointpos-stream", None, "position"),
 ]
 
 DOWNLOAD_PATTERNS = ["params/**", "assets/**", "_CHECKPOINT_METADATA"]
@@ -120,6 +123,27 @@ def _download(repo: str, dest: Path) -> None:
     snapshot_download(repo_id=repo, local_dir=str(dest), allow_patterns=DOWNLOAD_PATTERNS)
     size_gb = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file()) / 1e9
     log.info(f"downloaded {size_gb:.1f} GB in {time.time() - t0:.0f}s")
+
+
+# Some uploaded checkpoints dropped assets/<asset_id>/norm_stats.json. These polaris/droid finetunes
+# all reuse the SAME base DROID norm stats (byte-identical across sibling repos), so when a downloaded
+# checkpoint lacks the file we backfill it from a known-good sibling. Serving fails without it.
+_NORM_STATS_FALLBACK_REPO = "SamratSahoo/pi05polaris_droidfull_toys300_vae_sim"
+
+
+def _ensure_norm_stats(ckpt_dir: Path) -> None:
+    """Backfill assets/droid/norm_stats.json if the downloaded checkpoint is missing it."""
+    if list((ckpt_dir / "assets").glob("*/norm_stats.json")):
+        return
+    from huggingface_hub import hf_hub_download
+
+    log.warning(f"{ckpt_dir.name}: assets/*/norm_stats.json missing; "
+                f"backfilling from {_NORM_STATS_FALLBACK_REPO}")
+    dst = ckpt_dir / "assets" / "droid"
+    dst.mkdir(parents=True, exist_ok=True)
+    src = hf_hub_download(repo_id=_NORM_STATS_FALLBACK_REPO, filename="assets/droid/norm_stats.json")
+    shutil.copyfile(src, dst / "norm_stats.json")
+    log.info(f"backfilled norm_stats.json -> {dst / 'norm_stats.json'}")
 
 
 def _launch_server(config: str, checkpoint: str, xla_mem_fraction: float = 0.5) -> "subprocess.Popen":
@@ -236,6 +260,7 @@ def main(policies_filter=None, scenes_filter=None, num_rollouts=8, record_video=
             else:
                 _purge_hf_cache(repo)
                 _download(repo, ckpt_dir)
+                _ensure_norm_stats(ckpt_dir)
                 checkpoint = str(ckpt_dir)
                 log.info(f"free disk after download: {_free_disk_gb():.0f} GB")
             server = _launch_server(config, checkpoint, xla_mem_fraction)
