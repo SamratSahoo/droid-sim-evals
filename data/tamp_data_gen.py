@@ -17,9 +17,10 @@ Data representation (see plan / README):
                          policies chatter the gripper open/closed.
   * actions (8)       -> [7 joint velocities | 1 gripper command], from the TAMP plan, on the
                          SAME 15 Hz recorded-frame timeline as the proprioception. The 7 joint velocities are
-                         normalized into DROID's [-1, 1] action convention (divided by MAX_JOINT_DELTA*FPS =
-                         3.0 rad/s, then clipped) so the dataset matches lerobot/droid_1.0.1 for pi0.5-droid
-                         finetuning. Pre-normalization they are
+                         the cuRobo plan's commanded joint velocity, only CLIPPED to DROID's [-1, 1] action
+                         box (NOT /3'd -- measured proprioception shows the plan velocity already sits at
+                         ~DROID scale, and /3'ing deploys ~3x too slow through the undertracking
+                         RobotEnv(joint_velocity); mirrors build_lerobot.py). They are
                          the per-frame forward difference of the COMMANDED joint positions (the cuRobo waypoint
                          the client issued each step) -- i.e. the velocity actually commanded: ~zero while the
                          arm holds during a gripper open/close, the planned velocity during motion. (Finite-
@@ -89,14 +90,11 @@ DEFAULT_FS_DIR = str(_REPO_ROOT / "FoundationStereo")
 FPS = 15
 PLAN_DT = 0.02  # tiptop/cuRobo trajectories are time-parameterized at 50 Hz.
 
-# DROID joint-velocity action convention. DROID's control layer treats the joint-velocity action as a
-# DIMENSIONLESS command in [-1, 1]: value v -> per-step joint delta v * MAX_JOINT_DELTA rad over one
-# 1/FPS s tick, so rad/s = v * MAX_JOINT_DELTA * FPS. cuRobo plan velocities are physical rad/s, so to
-# match lerobot/droid_1.0.1 (required for pi0.5-droid finetuning + droid+toys mixtures) the training
-# action is divided by that product and clipped to the unit box. Mirrors data-collection/collect/
-# build_lerobot.py so real and sim datasets share one action convention.
-MAX_JOINT_DELTA = 0.2                        # rad per control step (droid relative_max_joint_delta)
-JOINT_VEL_RADPS_PER_UNIT = MAX_JOINT_DELTA * FPS  # = 3.0 rad/s at |v| = 1
+# DROID joint-velocity action convention: a command in [-1, 1] the deploy executor (RobotEnv) reads
+# directly. The cuRobo plan velocity (commanded rad/s) already sits at ~DROID scale, so we only CLIP it
+# to the unit box -- we do NOT divide by 3: measured proprioception shows /3'ing deploys ~3x too slow
+# (RobotEnv(joint_velocity) undertracks). Mirrors data-collection/collect/build_lerobot.py's clip-only
+# tamp path so real and sim datasets share one action convention. See memory joint-velocity-droid-normalization.
 INSTRUCTION = "Place the toys on the plate with no collisions"  # scene 6 (from full_eval.py)
 TOY_NAMES = ["blue_toy", "brown_toy", "pink_toy"]
 SCENE_OBJECTS = ["plate"] + TOY_NAMES
@@ -917,16 +915,16 @@ def build_lerobot_dataset(
         # is joint velocity[7] + gripper[1] (the pi05-DROID action space); the writer splits it into
         # action.joint_velocity / action.gripper_position for the DROID v3.0 schema.
         aligned = {feat: np.stack([decoded[feat][img_sel[feat][i]] for i in range(n)]) for feat in VIDEO_KEY_MAP}
-        # Normalize physical rad/s plan velocities into DROID's [-1, 1] action convention (see
-        # JOINT_VEL_RADPS_PER_UNIT) so this dataset matches lerobot/droid_1.0.1 for pi0.5-droid finetuning.
-        vel_norm = vel[:n] / JOINT_VEL_RADPS_PER_UNIT
-        frac_clipped = float(np.mean(np.abs(vel_norm) > 1.0)) if vel_norm.size else 0.0
+        # The cuRobo plan velocity is already at ~DROID scale, so we only CLIP it to the [-1,1] action
+        # box -- NOT /3 (measured proprioception shows /3'ing deploys ~3x too slow through the
+        # undertracking RobotEnv(joint_velocity)). Mirrors build_lerobot.py's clip-only tamp path.
+        frac_clipped = float(np.mean(np.abs(vel[:n]) > 1.0)) if vel[:n].size else 0.0
         if frac_clipped > 0.01:
             logger.warning(
-                f"{ep.name}: {frac_clipped:.1%} of joint-velocity elements exceeded DROID's "
-                f"+/-{JOINT_VEL_RADPS_PER_UNIT:.1f} rad/s envelope and were clipped to [-1, 1]"
+                f"{ep.name}: {frac_clipped:.1%} of joint-velocity elements exceeded the [-1, 1] "
+                f"envelope and were clipped"
             )
-        vel_norm = np.clip(vel_norm, -1.0, 1.0).astype(np.float32)
+        vel_norm = np.clip(vel[:n], -1.0, 1.0).astype(np.float32)
         ep_actions = np.concatenate([vel_norm, g_action[:n].reshape(n, 1)], axis=1).astype(np.float32)
         writer.add_episode(
             images=aligned,
