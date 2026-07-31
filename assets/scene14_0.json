@@ -1,0 +1,27 @@
+{
+  "_comment": "Sidecar for scene14_0.usd (a byte copy of scene6_0.usd: same table, same dome). Two cubes and two trays laid out for the SIMULTANEOUS dual-arm demo, matching cutamp/scripts/dual_arm_demo.py exactly -- one cube/tray pair on each side of the bimanual YAM so neither arm has to reach across the other. Poses are world metres (box `pos` is the centre); the table-top collider surface is at z=0.0451. Used by tools/replay_dual_plan.py.",
+  "objects": [
+    {
+      "name": "tray_a", "kind": "box", "size": [0.16, 0.16, 0.01],
+      "pos": [0.52, 0.23, 0.0501], "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.9, 0.9, 0.9], "mass": 0.5, "kinematic": true
+    },
+    {
+      "name": "tray_b", "kind": "box", "size": [0.16, 0.16, 0.01],
+      "pos": [0.52, -0.23, 0.0501], "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.9, 0.9, 0.9], "mass": 0.5, "kinematic": true
+    },
+    {
+      "name": "cube_a", "kind": "box", "size": [0.05, 0.05, 0.05],
+      "pos": [0.38, 0.25, 0.0701], "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.1, 0.3, 0.9], "mass": 0.05,
+      "rigid": { "static_friction": 1.0, "dynamic_friction": 0.9, "solver_iters": 32 }
+    },
+    {
+      "name": "cube_b", "kind": "box", "size": [0.05, 0.05, 0.05],
+      "pos": [0.38, -0.25, 0.0701], "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.9, 0.3, 0.1], "mass": 0.05,
+      "rigid": { "static_friction": 1.0, "dynamic_friction": 0.9, "solver_iters": 32 }
+    }
+  ]
+}

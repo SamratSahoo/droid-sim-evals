@@ -319,7 +319,10 @@ class TiptopWebsocketClient(InferenceClient):
         if self._current_waypoint_idx >= len(self._current_trajectory):
             self._action_chunk_done = True
 
-        if waypoint.shape[0] == 7:
+        # cuTAMP trajectories carry arm joints only, so append the gripper column the env's action
+        # term expects. Comparing against the measured arm dof (rather than a hardcoded 7) keeps this
+        # correct for the 6-DOF YAM as well as the 7-DOF Franka.
+        if waypoint.shape[0] == curr_obs["joint_position"].size:
             action = np.concatenate([waypoint, np.array([self._last_gripper_state])])
         else:
             action = waypoint

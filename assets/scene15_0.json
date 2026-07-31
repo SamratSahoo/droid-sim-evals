@@ -1,0 +1,16 @@
+{
+  "_comment": "Sidecar for scene15_0.usd (a byte copy of scene6_0.usd: same table, same dome). The HANDOVER demo scene, matching cutamp/scripts/dual_arm_demo.py --task handover exactly: one 22 cm bar on the LEFT arm's side and one tray on the RIGHT arm's side, deliberately out of the left arm's reach, so the bar can only get there by being passed between the hands. The bar is long because a handover needs both grippers on the same object at once -- on a 5 cm cube the two YAM hands leave ~1 mm of arm clearance, at +/-8 cm on this bar they leave ~127 mm. Poses are world metres (box `pos` is the centre); the table-top collider surface is at z=0.0451. Used by tools/replay_dual_plan.py.",
+  "objects": [
+    {
+      "name": "tray", "kind": "box", "size": [0.18, 0.18, 0.01],
+      "pos": [0.52, -0.26, 0.0501], "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.9, 0.9, 0.9], "mass": 0.5, "kinematic": true
+    },
+    {
+      "name": "bar", "kind": "box", "size": [0.05, 0.22, 0.05],
+      "pos": [0.40, 0.26, 0.0701], "rot": [1.0, 0.0, 0.0, 0.0],
+      "color": [0.2, 0.6, 0.3], "mass": 0.08,
+      "rigid": { "static_friction": 1.0, "dynamic_friction": 0.9, "solver_iters": 32 }
+    }
+  ]
+}
