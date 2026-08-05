@@ -32,6 +32,15 @@ VIDEO_KEY_MAP = {
     "wrist_image_left": "observation.images.wrist_left",
 }
 
+# The bimanual YAM's views: one fixed third-person camera plus a wrist camera per arm. Named the way
+# the MolmoAct2 / openpi bimanual configs name them, so a dataset built here feeds those directly.
+# Pass as ``video_keys=`` to V3DatasetWriter; the DROID map above stays the default.
+YAM_VIDEO_KEY_MAP = {
+    "observation.images.top": "observation.images.top",
+    "observation.images.left_wrist": "observation.images.left_wrist",
+    "observation.images.right_wrist": "observation.images.right_wrist",
+}
+
 # Fixed pyarrow schema for the v3.0 data parquet (DROID low-dim columns). Lists match DROID (variable
 # list<float>), which openpi's v3.0 reader flattens per row.
 _DATA_SCHEMA = pa.schema(
@@ -52,19 +61,25 @@ _DATA_SCHEMA = pa.schema(
 )
 
 
-def _feature_dict(height: int, width: int) -> dict:
+def _feature_dict(
+    height: int, width: int, video_keys=None, joint_dim: int = 7, gripper_dim: int = 1
+) -> dict:
+    """Feature spec. ``joint_dim``/``gripper_dim`` are 7/1 for a single 7-DOF arm (DROID) and 12/2
+    for the bimanual YAM, whose state is [L joints 1-6, L gripper, R joints 1-6, R gripper]."""
     def feat(dtype, shape):
         return {"dtype": dtype, "shape": list(shape), "names": None}
 
+    keys = (video_keys or VIDEO_KEY_MAP).values()
+    state_dim = joint_dim + gripper_dim
     return {
-        **{v: feat("video", [height, width, 3]) for v in VIDEO_KEY_MAP.values()},
-        "observation.state.joint_position": feat("float32", [7]),
-        "observation.state.gripper_position": feat("float32", [1]),
-        "observation.state": feat("float32", [8]),
-        "action.joint_position": feat("float32", [7]),
-        "action.joint_velocity": feat("float32", [7]),
-        "action.gripper_position": feat("float32", [1]),
-        "action": feat("float32", [8]),
+        **{v: feat("video", [height, width, 3]) for v in keys},
+        "observation.state.joint_position": feat("float32", [joint_dim]),
+        "observation.state.gripper_position": feat("float32", [gripper_dim]),
+        "observation.state": feat("float32", [state_dim]),
+        "action.joint_position": feat("float32", [joint_dim]),
+        "action.joint_velocity": feat("float32", [joint_dim]),
+        "action.gripper_position": feat("float32", [gripper_dim]),
+        "action": feat("float32", [state_dim]),
         "timestamp": feat("float32", [1]),
         "frame_index": feat("int64", [1]),
         "episode_index": feat("int64", [1]),
@@ -87,18 +102,40 @@ class V3DatasetWriter:
         height: int = 180,
         width: int = 320,
         robot_type: str = "panda",
+        video_keys: dict[str, str] | None = None,
+        joint_dim: int = 7,
+        gripper_dim: int = 1,
+        n_arms: int = 1,
     ):
         self.root = Path(root)
         self.fps = int(fps)
         self.height = int(height)
         self.width = int(width)
         self.robot_type = robot_type
+        # Camera set and state width are per-embodiment. The defaults are DROID's, so every existing
+        # caller writes a byte-identical dataset; the bimanual YAM passes YAM_VIDEO_KEY_MAP with
+        # joint_dim=12 / gripper_dim=2.
+        self.video_keys = dict(video_keys or VIDEO_KEY_MAP)
+        self.joint_dim = int(joint_dim)
+        self.gripper_dim = int(gripper_dim)
+        self.action_dim = self.joint_dim + self.gripper_dim
+        # How the flat `observation.state` / `action` vectors are laid out. With one arm it is
+        # DROID's [joints..., gripper]. With two it is PER ARM -- [L joints, L gripper, R joints,
+        # R gripper] -- which is what openpi's pi05_molmoact2_bimanual and the MolmoAct2 dataset
+        # expect; block-concatenating all joints then all grippers would load with the right shape
+        # and the wrong meaning, which is the worst kind of wrong.
+        self.n_arms = int(n_arms)
+        if self.joint_dim % self.n_arms or self.gripper_dim % self.n_arms:
+            raise ValueError(
+                f"joint_dim={self.joint_dim} and gripper_dim={self.gripper_dim} must both divide "
+                f"n_arms={self.n_arms}"
+            )
         (self.root / "data" / "chunk-000").mkdir(parents=True, exist_ok=True)
         (self.root / "meta" / "episodes" / "chunk-000").mkdir(parents=True, exist_ok=True)
 
         # One MP4 per camera (all episodes concatenated), encoded incrementally.
         self._encoders: dict[str, tuple] = {}
-        for droid_key in VIDEO_KEY_MAP.values():
+        for droid_key in self.video_keys.values():
             path = self.root / "videos" / droid_key / "chunk-000" / "file-000.mp4"
             path.parent.mkdir(parents=True, exist_ok=True)
             container = av.open(str(path), mode="w")
@@ -136,6 +173,20 @@ class V3DatasetWriter:
         for packet in stream.encode(frame):
             container.mux(packet)
 
+    def _interleave(self, joints: np.ndarray, grippers: np.ndarray) -> np.ndarray:
+        """Flatten per-arm: [arm0 joints, arm0 gripper, arm1 joints, arm1 gripper, ...].
+
+        Single-arm callers get plain concatenation, byte-identical to before.
+        """
+        if self.n_arms == 1:
+            return np.concatenate([joints, grippers], axis=1)
+        jpa, gpa = self.joint_dim // self.n_arms, self.gripper_dim // self.n_arms
+        blocks = []
+        for a in range(self.n_arms):
+            blocks.append(joints[:, a * jpa : (a + 1) * jpa])
+            blocks.append(grippers[:, a * gpa : (a + 1) * gpa])
+        return np.concatenate(blocks, axis=1)
+
     # -- main API -----------------------------------------------------------------------------
     def add_episode(
         self,
@@ -150,21 +201,22 @@ class V3DatasetWriter:
         """Append one episode.
 
         Args:
-            images: {common image key -> [N, H, W, 3] uint8}. Keys must be in VIDEO_KEY_MAP.
-            joint_position: [N, 7]; gripper_position: [N, 1]; actions: [N, 8] (joint_velocity[7] + gripper[1]).
-            action_joint_position: [N, 7] COMMANDED/target joint positions (DROID 1.0.1 action.joint_position).
+            images: {common image key -> [N, H, W, 3] uint8}. Keys must be in ``self.video_keys``.
+            joint_position: [N, joint_dim]; gripper_position: [N, gripper_dim];
+                actions: [N, joint_dim + gripper_dim] (joint velocity, then gripper).
+            action_joint_position: [N, joint_dim] COMMANDED/target joint positions (DROID 1.0.1 action.joint_position).
                 If None, falls back to the measured ``joint_position`` (proxy for legacy sources that
                 never recorded commands, e.g. a v2.1 merge input).
             task: language instruction for this episode.
         """
-        joint_position = np.asarray(joint_position, dtype=np.float32).reshape(-1, 7)
-        gripper_position = np.asarray(gripper_position, dtype=np.float32).reshape(-1, 1)
-        actions = np.asarray(actions, dtype=np.float32).reshape(-1, 8)
+        joint_position = np.asarray(joint_position, dtype=np.float32).reshape(-1, self.joint_dim)
+        gripper_position = np.asarray(gripper_position, dtype=np.float32).reshape(-1, self.gripper_dim)
+        actions = np.asarray(actions, dtype=np.float32).reshape(-1, self.action_dim)
         n = len(joint_position)
         if action_joint_position is None:
             action_joint_position = joint_position  # proxy: measured state (legacy sources w/o commands)
         else:
-            action_joint_position = np.asarray(action_joint_position, dtype=np.float32).reshape(-1, 7)
+            action_joint_position = np.asarray(action_joint_position, dtype=np.float32).reshape(-1, self.joint_dim)
         if n == 0:
             return
         if not (len(gripper_position) == n and len(actions) == n and len(action_joint_position) == n):
@@ -178,7 +230,7 @@ class V3DatasetWriter:
         from_ts = self._frame_cursor / self.fps
 
         # Encode video frames (per camera) for this episode.
-        for common_key, droid_key in VIDEO_KEY_MAP.items():
+        for common_key, droid_key in self.video_keys.items():
             frames = images[common_key]
             if len(frames) != n:
                 raise ValueError(f"{common_key}: {len(frames)} frames vs {n} state rows")
@@ -188,9 +240,10 @@ class V3DatasetWriter:
         to_ts = self._frame_cursor / self.fps
 
         # Low-dim rows -> one parquet row group.
-        state = np.concatenate([joint_position, gripper_position], axis=1)  # [N, 8]
-        joint_velocity = actions[:, :7]
-        gripper_action = actions[:, 7:8]
+        joint_velocity = actions[:, : self.joint_dim]
+        gripper_action = actions[:, self.joint_dim :]
+        state = self._interleave(joint_position, gripper_position)
+        flat_action = self._interleave(joint_velocity, gripper_action)
         start = self._global_index
         table = pa.table(
             {
@@ -200,7 +253,7 @@ class V3DatasetWriter:
                 "action.joint_position": list(action_joint_position),
                 "action.joint_velocity": list(joint_velocity),
                 "action.gripper_position": list(gripper_action),
-                "action": list(actions),
+                "action": list(flat_action),
                 "timestamp": np.arange(n, dtype=np.float32) / self.fps,
                 "frame_index": np.arange(n, dtype=np.int64),
                 "episode_index": np.full(n, episode_index, dtype=np.int64),
@@ -221,7 +274,7 @@ class V3DatasetWriter:
             "dataset_from_index": start,
             "dataset_to_index": start + n,
         }
-        for droid_key in VIDEO_KEY_MAP.values():
+        for droid_key in self.video_keys.values():
             ep_meta[f"videos/{droid_key}/chunk_index"] = 0
             ep_meta[f"videos/{droid_key}/file_index"] = 0
             ep_meta[f"videos/{droid_key}/from_timestamp"] = from_ts
@@ -240,7 +293,7 @@ class V3DatasetWriter:
 
         # Validate every encoded MP4 opens and has the expected frame count (a truncated / non-finalized
         # video would only fail later, with "Invalid data", at load time).
-        for droid_key in VIDEO_KEY_MAP.values():
+        for droid_key in self.video_keys.values():
             vpath = self.root / "videos" / droid_key / "chunk-000" / "file-000.mp4"
             try:
                 with av.open(str(vpath)) as container:
@@ -269,7 +322,9 @@ class V3DatasetWriter:
             "chunks_size": 1000,
             "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
             "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-            "features": _feature_dict(self.height, self.width),
+            "features": _feature_dict(
+                self.height, self.width, self.video_keys, self.joint_dim, self.gripper_dim
+            ),
         }
         (self.root / "meta" / "info.json").write_text(json.dumps(info, indent=2))
         self._finalized = True
