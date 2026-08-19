@@ -19,7 +19,8 @@ from dataclasses import MISSING
 
 import trimesh
 
-import isaacsim.core.utils.prims as prim_utils
+import isaaclab.sim.utils as prim_utils  # was isaacsim.core.utils.prims (removed in Isaac Sim 6.0);
+# isaaclab.sim.utils exposes the same get_prim_at_path/create_prim with compatible signatures
 from pxr import PhysxSchema, Usd, UsdPhysics
 
 import isaaclab.sim as sim_utils

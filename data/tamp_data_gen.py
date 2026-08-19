@@ -231,6 +231,9 @@ def read_object_poses_vec(env) -> List[dict]:
         obj = _get_rigid(scene, name)
         pos = obj.data.root_pos_w.detach().cpu().numpy().astype(np.float64)  # (N, 3)
         quat = obj.data.root_quat_w.detach().cpu().numpy().astype(np.float64)  # (N, 4)
+        # Isaac Lab 3.0 returns root_quat_w in (x, y, z, w) order; this pipeline is wxyz throughout
+        # (see "Quaternion helpers (wxyz, Isaac convention)"). Reorder xyzw -> wxyz.
+        quat = quat[:, [3, 0, 1, 2]]
         for i in range(n):
             out[i][name] = {"pos": pos[i], "quat": quat[i]}
     return out
@@ -246,14 +249,17 @@ def write_poses_vec(env, poses_per_env: List[dict], env_origins) -> None:
 
     scene = env.unwrapped.scene
     n = int(env.unwrapped.num_envs)
+    # Use the env's torch device, NOT obj.data.root_pos_w.device: under Isaac Lab 3.0 the latter is
+    # no longer a plain torch.device (torch.zeros rejects it as an invalid `device=Device` arg).
+    dev = env.unwrapped.device
     for name in SCENE_OBJECTS:
         obj = _get_rigid(scene, name)
-        dev = obj.data.root_pos_w.device
         pose = torch.zeros((n, 7), dtype=torch.float32, device=dev)
         for i in range(n):
             p = torch.tensor(poses_per_env[i][name], dtype=torch.float32, device=dev)
             pose[i, :3] = p[:3] + env_origins[i]
-            pose[i, 3:] = p[3:]
+            # p holds wxyz (pipeline convention); Isaac Lab 3.0 write_root_pose_to_sim expects (x,y,z,w).
+            pose[i, 3:] = p[[4, 5, 6, 3]]  # wxyz -> xyzw
         obj.write_root_pose_to_sim(pose)
         obj.write_root_velocity_to_sim(torch.zeros((n, 6), dtype=torch.float32, device=dev))
 

@@ -3,6 +3,10 @@ import logging
 import torch
 import isaaclab.sim as sim_utils
 import isaaclab.envs.mdp as mdp
+# Isaac Lab 3.0's mdp/__init__.py uses lazy_export(), which flattens term FUNCTIONS into the mdp
+# namespace but no longer binds the `observations` submodule as an attribute (`mdp.observations`
+# raises AttributeError). Import the submodule explicitly so `.image` resolves on 2.2 and 3.0 alike.
+from isaaclab.envs.mdp import observations as mdp_observations
 import numpy as np
 
 from typing import List
@@ -143,7 +147,7 @@ class SceneCfg(InteractiveSceneCfg):
             texture_file=str((DATA_PATH / "backgrounds" / "billiard_hall_4k.hdr").resolve()),
             texture_format="latlong",
         ),
-        init_state=AssetBaseCfg.InitialStateCfg(rot=(0.38268343, 0.0, 0.0, 0.92388)),
+        init_state=AssetBaseCfg.InitialStateCfg(rot=(0.0, 0.0, 0.92388, 0.38268343)),  # xyzw (Isaac Lab 3.0): 135deg yaw about Z; was wxyz (0.38268343,0,0,0.92388)
     )
 
     robot = NVIDIA_DROID
@@ -166,7 +170,7 @@ class SceneCfg(InteractiveSceneCfg):
             vertical_aperture=3.024,
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.05, 0.57, 0.66), rot=(-0.393, -0.195, 0.399, 0.805), convention="opengl"
+            pos=(0.05, 0.57, 0.66), rot=(-0.195, 0.399, 0.805, -0.393), convention="opengl"  # xyzw (Isaac Lab 3.0); was wxyz (-0.393,-0.195,0.399,0.805)
         ),
     )
 
@@ -182,7 +186,7 @@ class SceneCfg(InteractiveSceneCfg):
             vertical_aperture=3.024,
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.05, -0.57, 0.66), rot=(0.805, 0.399, -0.195, -0.393), convention="opengl"
+            pos=(0.05, -0.57, 0.66), rot=(0.399, -0.195, -0.393, 0.805), convention="opengl"  # xyzw (Isaac Lab 3.0); was wxyz (0.805,0.399,-0.195,-0.393)
         ),
     )
 
@@ -198,7 +202,7 @@ class SceneCfg(InteractiveSceneCfg):
             vertical_aperture=3.024,
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.011, -0.031, -0.074), rot=(-0.420, 0.570, 0.576, -0.409), convention="opengl"
+            pos=(0.011, -0.031, -0.074), rot=(0.570, 0.576, -0.409, -0.420), convention="opengl"  # xyzw (Isaac Lab 3.0); was wxyz (-0.420,0.570,0.576,-0.409)
         ),
     )
 
@@ -581,7 +585,7 @@ def _safe_image(
     """Wrapper around mdp.observations.image that returns zeros if the camera annotator
     has no data yet (e.g. GPU OOM during init, or shape-probing before first sim step)."""
     try:
-        return mdp.observations.image(env, sensor_cfg=sensor_cfg, data_type=data_type, normalize=normalize)
+        return mdp_observations.image(env, sensor_cfg=sensor_cfg, data_type=data_type, normalize=normalize)
     except RuntimeError:
         sensor = env.scene[sensor_cfg.name]
         h, w = sensor.cfg.height, sensor.cfg.width
@@ -649,7 +653,12 @@ def wrist_cam_quat_w(
 ):
     """Get wrist camera quaternion in world frame (w, x, y, z)."""
     sensor = env.scene[sensor_cfg.name]
-    return sensor.data.quat_w_ros  # ROS convention: w, x, y, z
+    # Isaac Lab 3.0 changed camera CameraData.quat_w_ros element order to (x, y, z, w) (warp quatf);
+    # Isaac Lab 2.x returned (w, x, y, z). The perception client (_pose_to_matrix) and this func's
+    # contract expect (w, x, y, z), so reorder xyzw -> wxyz. Without this the reconstructed camera
+    # orientation is garbage: the tabletop point cloud comes out ~vertical, M2T2 sees an OOD scene and
+    # over-segments it into 60+ objects / 500k grasps, every /predict exceeds 30s and all plans fail.
+    return sensor.data.quat_w_ros[..., [3, 0, 1, 2]]  # xyzw (Isaac Lab 3.0) -> wxyz
 
 
 @configclass
@@ -745,12 +754,21 @@ class EnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 1 / (15 * 8)
         self.sim.render_interval = self.decimation
 
-        self.sim.physx.enable_ccd = True
-        self.sim.physx.gpu_temp_buffer_capacity = 2**26
-        self.sim.physx.gpu_heap_capacity = 2**26
-        self.sim.physx.gpu_collision_stack_size = 2**26
-        # Headroom for PhysX FEM soft-body (deformable toy) contacts in scene 6.
-        self.sim.physx.gpu_max_soft_body_contacts = 2**21
+        # PhysX GPU-buffer + CCD tuning (prevents buffer overflow at 64-128 envs; CCD stops fast
+        # objects tunneling). Isaac Lab 3.0 moved this to `sim.physics = PhysxCfg(...)` in the separate
+        # isaaclab_physx package (physics backends are now pluggable, Newton is the other option);
+        # Isaac Lab <=2.2 used `sim.physx.<field>` mutation. Support both so a driver rollback to the
+        # old Sim-5.0 container still works. gpu_max_soft_body_contacts headroom is for scene-6's FEM
+        # deformable toys.
+        _physx = dict(enable_ccd=True, gpu_temp_buffer_capacity=2**26, gpu_heap_capacity=2**26,
+                      gpu_collision_stack_size=2**26, gpu_max_soft_body_contacts=2**21)
+        try:
+            from isaaclab_physx.physics import PhysxCfg  # Isaac Lab 3.0+
+
+            self.sim.physics = PhysxCfg(**_physx)
+        except ImportError:
+            for _k, _v in _physx.items():  # Isaac Lab <= 2.2
+                setattr(self.sim.physx, _k, _v)
         self.rerender_on_reset = True
 
     

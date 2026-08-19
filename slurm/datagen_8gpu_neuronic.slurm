@@ -215,13 +215,19 @@ done
 # shares host net). Each worker gets its OWN writable Kit dirs + container HOME (concurrent writers
 # must not share). Missing worker deps are on PYTHONPATH (see container_deps).
 export APPTAINER_CACHEDIR=/n/fs/tamp-vla/.cache/apptainer
-SIF=/n/fs/tamp-vla/.cache/apptainer/isaac_lab_220.sif
+# Isaac image. Default = Isaac Lab 3.0 / Isaac Sim 6.0 sandbox dir (isaac_lab_300_dir), REQUIRED after
+# the 2026-07-14 cluster driver upgrade to 610/CUDA13 which broke the old isaac_lab_220.sif (Isaac
+# Sim 5.0): its Warp 1.7.1 + RTX plugin segfault on drv610. Override with ISAAC_IMAGE=... (e.g. the
+# old .sif) if a compatible driver ever returns. apptainer exec runs a sandbox dir like a .sif.
+SIF="${ISAAC_IMAGE:-/n/fs/tamp-vla/.cache/apptainer/isaac_lab_300_dir}"
 DEPS=/n/fs/tamp-vla/.cache/container_deps
-OPC=$REPO_ROOT/openpi/packages/openpi-client
+# openpi_client lives under packages/openpi-client/src (the importable root). The 6.0 container (py3.12)
+# does not have it preinstalled, so PYTHONPATH must point at src/, not the package dir.
+OPC=$REPO_ROOT/openpi/packages/openpi-client/src
 CROOT="$OUT_ROOT/container"
 base=$((TOTAL_EPISODES / NUM_GPUS)); rem=$((TOTAL_EPISODES % NUM_GPUS))
 declare -a WORKER_PIDS WORKER_N
-echo "=== launching $NUM_GPUS containerized workers (Isaac Sim 5.0; split: first $rem get $((base + 1)), rest $base) ==="
+echo "=== launching $NUM_GPUS containerized workers (Isaac image: $SIF; split: first $rem get $((base + 1)), rest $base) ==="
 for ((i = 0; i < NUM_GPUS; i++)); do
   n=$base; [ $i -lt $rem ] && n=$((base + 1)); WORKER_N[$i]=$n
   port=$((TIPTOP_PORT_BASE + i))

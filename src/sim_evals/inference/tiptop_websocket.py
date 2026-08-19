@@ -216,6 +216,14 @@ class TiptopWebsocketClient(InferenceClient):
         if depth.ndim == 3 and depth.shape[-1] == 1:
             depth = depth.squeeze(-1)
 
+        # Isaac Sim 6.0's distance_to_image_plane returns +inf for background/no-hit pixels (Isaac 5.0
+        # returned 0). The tiptop server's depth_to_xyz/get_o3d_pcd never filters non-finite depth, so
+        # inf pixels become points at infinity that poison open3d's voxel_down_sample (raises
+        # "voxel_size is too small") or get mangled by JSON into garbage finite points -> M2T2 then
+        # over-segments the scene into dozens of objects with 100x too many grasps and every plan
+        # times out. Zero out non-finite depth to restore the Isaac 5.0 sentinel the pipeline expects.
+        depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+
         return depth
 
     def _get_camera_params(self, raw_obs: dict) -> tuple[np.ndarray, np.ndarray]:

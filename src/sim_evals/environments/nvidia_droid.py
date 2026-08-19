@@ -34,7 +34,7 @@ NVIDIA_DROID = ArticulationCfg(
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0, 0, 0),
-            rot=(1, 0, 0, 0),
+            rot=(0, 0, 0, 1),  # xyzw identity (Isaac Lab 3.0); was wxyz (1,0,0,0), which 3.0 reads as 180deg-about-X and flips the robot (wrist cam ends up below the base)
             joint_pos={
                 "panda_joint1": 0.0,
                 "panda_joint2": -1 / 5 * np.pi,
